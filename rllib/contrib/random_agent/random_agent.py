@@ -1,7 +1,3 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import numpy as np
 
 from ray.rllib.agents.trainer import Trainer, with_common_config
@@ -16,6 +12,7 @@ class RandomAgent(Trainer):
     _name = "RandomAgent"
     _default_config = with_common_config({
         "rollouts_per_iteration": 10,
+        "framework": "tf",  # not used
     })
 
     @override(Trainer)
@@ -23,7 +20,7 @@ class RandomAgent(Trainer):
         self.env = env_creator(config["env_config"])
 
     @override(Trainer)
-    def _train(self):
+    def step(self):
         rewards = []
         steps = 0
         for _ in range(self.config["rollouts_per_iteration"]):

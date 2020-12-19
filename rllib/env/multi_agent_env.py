@@ -1,12 +1,15 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+from typing import Tuple, Dict, List
+import gym
 
 from ray.rllib.utils.annotations import PublicAPI
+from ray.rllib.utils.typing import MultiAgentDict, AgentID
+
+# If the obs space is Dict type, look for the global state under this key.
+ENV_STATE = "state"
 
 
 @PublicAPI
-class MultiAgentEnv(object):
+class MultiAgentEnv:
     """An environment that hosts multiple independent agents.
 
     Agents are identified by (string) agent ids. Note that these "agents" here
@@ -22,9 +25,9 @@ class MultiAgentEnv(object):
             "traffic_light_1": [0, 3, 5, 1],
         }
         >>> obs, rewards, dones, infos = env.step(
-            action_dict={
-                "car_0": 1, "car_1": 0, "traffic_light_1": 2,
-            })
+        ...    action_dict={
+        ...        "car_0": 1, "car_1": 0, "traffic_light_1": 2,
+        ...    })
         >>> print(rewards)
         {
             "car_0": 3,
@@ -45,7 +48,7 @@ class MultiAgentEnv(object):
     """
 
     @PublicAPI
-    def reset(self):
+    def reset(self) -> MultiAgentDict:
         """Resets the env and returns observations from ready agents.
 
         Returns:
@@ -54,7 +57,9 @@ class MultiAgentEnv(object):
         raise NotImplementedError
 
     @PublicAPI
-    def step(self, action_dict):
+    def step(
+            self, action_dict: MultiAgentDict
+    ) -> Tuple[MultiAgentDict, MultiAgentDict, MultiAgentDict, MultiAgentDict]:
         """Returns observations from ready agents.
 
         The returns are dicts mapping from agent_id strings to values. The
@@ -74,7 +79,11 @@ class MultiAgentEnv(object):
 # yapf: disable
 # __grouping_doc_begin__
     @PublicAPI
-    def with_agent_groups(self, groups, obs_space=None, act_space=None):
+    def with_agent_groups(
+            self,
+            groups: Dict[str, List[AgentID]],
+            obs_space: gym.Space = None,
+            act_space: gym.Space = None) -> "MultiAgentEnv":
         """Convenience method for grouping together agents in this env.
 
         An agent group is a list of agent ids that are mapped to a single
@@ -91,7 +100,7 @@ class MultiAgentEnv(object):
 
         This API is experimental.
 
-        Arguments:
+        Args:
             groups (dict): Mapping from group id to a list of the agent ids
                 of group members. If an agent id is not present in any group
                 value, it will be left ungrouped.

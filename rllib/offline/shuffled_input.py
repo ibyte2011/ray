@@ -1,12 +1,9 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import logging
 import random
 
 from ray.rllib.offline.input_reader import InputReader
 from ray.rllib.utils.annotations import override, DeveloperAPI
+from ray.rllib.utils.typing import SampleBatchType
 
 logger = logging.getLogger(__name__)
 
@@ -20,10 +17,10 @@ class ShuffledInput(InputReader):
     """
 
     @DeveloperAPI
-    def __init__(self, child, n=0):
+    def __init__(self, child: InputReader, n: int = 0):
         """Initialize a MixedInput.
 
-        Arguments:
+        Args:
             child (InputReader): child input reader to shuffle.
             n (int): if positive, shuffle input over this many batches.
         """
@@ -32,7 +29,7 @@ class ShuffledInput(InputReader):
         self.buffer = []
 
     @override(InputReader)
-    def next(self):
+    def next(self) -> SampleBatchType:
         if self.n <= 1:
             return self.child.next()
         if len(self.buffer) < self.n:

@@ -1,7 +1,3 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import click
 import logging
 import os
@@ -120,7 +116,8 @@ def list_trials(experiment_path,
     _check_tabulate()
 
     try:
-        checkpoints_df = Analysis(experiment_path).dataframe()
+        checkpoints_df = Analysis(experiment_path).dataframe(
+            metric="episode_reward_mean", mode="max")
     except TuneError:
         raise click.ClickException("No trial data found!")
 

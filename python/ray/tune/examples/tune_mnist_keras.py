@@ -1,13 +1,7 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import argparse
-import numpy as np
 from tensorflow.keras.datasets import mnist
 
-from ray.tune.integration.keras import TuneReporterCallback
-from ray.tune.examples.utils import get_mnist_data
+from ray.tune.integration.keras import TuneReportCallback
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -15,33 +9,24 @@ parser.add_argument(
 args, _ = parser.parse_known_args()
 
 
-def train_mnist(config, reporter):
+def train_mnist(config):
     # https://github.com/tensorflow/tensorflow/issues/32159
     import tensorflow as tf
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import (Dense, Dropout, Flatten, Conv2D,
-                                         MaxPooling2D)
     batch_size = 128
     num_classes = 10
     epochs = 12
 
-    x_train, y_train, x_test, y_test, input_shape = get_mnist_data()
-
-    model = Sequential()
-    model.add(
-        Conv2D(
-            32, kernel_size=(3, 3), activation="relu",
-            input_shape=input_shape))
-    model.add(Conv2D(64, (3, 3), activation="relu"))
-    model.add(MaxPooling2D(pool_size=(2, 2)))
-    model.add(Dropout(0.5))
-    model.add(Flatten())
-    model.add(Dense(config["hidden"], activation="relu"))
-    model.add(Dropout(0.5))
-    model.add(Dense(num_classes, activation="softmax"))
+    (x_train, y_train), (x_test, y_test) = mnist.load_data()
+    x_train, x_test = x_train / 255.0, x_test / 255.0
+    model = tf.keras.models.Sequential([
+        tf.keras.layers.Flatten(input_shape=(28, 28)),
+        tf.keras.layers.Dense(config["hidden"], activation="relu"),
+        tf.keras.layers.Dropout(0.2),
+        tf.keras.layers.Dense(num_classes, activation="softmax")
+    ])
 
     model.compile(
-        loss=tf.keras.losses.categorical_crossentropy,
+        loss="sparse_categorical_crossentropy",
         optimizer=tf.keras.optimizers.SGD(
             lr=config["lr"], momentum=config["momentum"]),
         metrics=["accuracy"])
@@ -53,7 +38,9 @@ def train_mnist(config, reporter):
         epochs=epochs,
         verbose=0,
         validation_data=(x_test, y_test),
-        callbacks=[TuneReporterCallback(reporter)])
+        callbacks=[TuneReportCallback({
+            "mean_accuracy": "accuracy"
+        })])
 
 
 if __name__ == "__main__":
@@ -62,18 +49,16 @@ if __name__ == "__main__":
     from ray.tune.schedulers import AsyncHyperBandScheduler
     mnist.load_data()  # we do this on the driver because it's not threadsafe
 
-    ray.init()
+    ray.init(num_cpus=4 if args.smoke_test else None)
     sched = AsyncHyperBandScheduler(
-        time_attr="training_iteration",
-        metric="mean_accuracy",
-        mode="max",
-        max_t=400,
-        grace_period=20)
+        time_attr="training_iteration", max_t=400, grace_period=20)
 
-    tune.run(
+    analysis = tune.run(
         train_mnist,
         name="exp",
         scheduler=sched,
+        metric="mean_accuracy",
+        mode="max",
         stop={
             "mean_accuracy": 0.99,
             "training_iteration": 5 if args.smoke_test else 300
@@ -85,9 +70,8 @@ if __name__ == "__main__":
         },
         config={
             "threads": 2,
-            "lr": tune.sample_from(lambda spec: np.random.uniform(0.001, 0.1)),
-            "momentum": tune.sample_from(
-                lambda spec: np.random.uniform(0.1, 0.9)),
-            "hidden": tune.sample_from(
-                lambda spec: np.random.randint(32, 512)),
+            "lr": tune.uniform(0.001, 0.1),
+            "momentum": tune.uniform(0.1, 0.9),
+            "hidden": tune.randint(32, 512),
         })
+    print("Best hyperparameters found were: ", analysis.best_config)

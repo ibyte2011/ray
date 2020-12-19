@@ -1,18 +1,17 @@
 # coding: utf-8
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import logging
 
 from ray.tune.trial import Trial, Checkpoint
 from ray.tune.error import TuneError
+from ray.tune.cluster_info import is_ray_cluster
 
 logger = logging.getLogger(__name__)
 
 
-class TrialExecutor(object):
-    """Manages platform-specific details such as resource handling
+class TrialExecutor:
+    """Module for interacting with remote trainables.
+
+    Manages platform-specific details such as resource handling
     and starting/stopping trials.
     """
 
@@ -27,6 +26,7 @@ class TrialExecutor(object):
         """
         self._queue_trials = queue_trials
         self._cached_trial_state = {}
+        self._trials_to_cache = set()
 
     def set_status(self, trial, status):
         """Sets status and checkpoints metadata if needed.
@@ -39,14 +39,17 @@ class TrialExecutor(object):
             trial (Trial): Trial to checkpoint.
             status (Trial.status): Status to set trial to.
         """
-        logger.debug("Trial %s: Changing status from %s to %s.", trial,
-                     trial.status, status)
+        if trial.status == status:
+            logger.debug("Trial %s: Status %s unchanged.", trial, trial.status)
+        else:
+            logger.debug("Trial %s: Changing status from %s to %s.", trial,
+                         trial.status, status)
         trial.set_status(status)
         if status in [Trial.TERMINATED, Trial.ERROR]:
             self.try_checkpoint_metadata(trial)
 
     def try_checkpoint_metadata(self, trial):
-        """Checkpoints metadata.
+        """Checkpoints trial metadata.
 
         Args:
             trial (Trial): Trial to checkpoint.
@@ -57,32 +60,37 @@ class TrialExecutor(object):
             return
         try:
             logger.debug("Trial %s: Saving trial metadata.", trial)
-            self._cached_trial_state[trial.trial_id] = trial.__getstate__()
+            # Lazy cache trials
+            self._trials_to_cache.add(trial)
         except Exception:
             logger.exception("Trial %s: Error checkpointing trial metadata.",
                              trial)
 
     def get_checkpoints(self):
         """Returns a copy of mapping of the trial ID to pickled metadata."""
-        return self._cached_trial_state.copy()
+        for trial in self._trials_to_cache:
+            self._cached_trial_state[trial.trial_id] = trial.get_json_state()
+        self._trials_to_cache.clear()
+        return self._cached_trial_state
 
     def has_resources(self, resources):
         """Returns whether this runner has at least the specified resources."""
         raise NotImplementedError("Subclasses of TrialExecutor must provide "
                                   "has_resources() method")
 
-    def start_trial(self, trial, checkpoint=None):
+    def start_trial(self, trial, checkpoint=None, train=True):
         """Starts the trial restoring from checkpoint if checkpoint is provided.
 
         Args:
             trial (Trial): Trial to be started.
-            checkpoint(Checkpoint): A Python object or path storing the state
+            checkpoint (Checkpoint): A Python object or path storing the state
             of trial.
+            train (bool): Whether or not to start training.
         """
         raise NotImplementedError("Subclasses of TrialExecutor must provide "
                                   "start_trial() method")
 
-    def stop_trial(self, trial, error=False, error_msg=None, stop_logger=True):
+    def stop_trial(self, trial, error=False, error_msg=None):
         """Stops the trial.
 
         Stops this trial, releasing all allocating resources.
@@ -92,7 +100,6 @@ class TrialExecutor(object):
         Args:
             error (bool): Whether to mark this trial as terminated in error.
             error_msg (str): Optional error message.
-            stop_logger (bool): Whether to shut down the trial logger.
         """
         raise NotImplementedError("Subclasses of TrialExecutor must provide "
                                   "stop_trial() method")
@@ -110,7 +117,7 @@ class TrialExecutor(object):
         assert trial.status == Trial.RUNNING, trial.status
         try:
             self.save(trial, Checkpoint.MEMORY)
-            self.stop_trial(trial, stop_logger=False)
+            self.stop_trial(trial)
             self.set_status(trial, Trial.PAUSED)
         except Exception:
             logger.exception("Error pausing runner.")
@@ -127,7 +134,7 @@ class TrialExecutor(object):
         self.start_trial(trial)
 
     def reset_trial(self, trial, new_config, new_experiment_tag):
-        """Tries to invoke `Trainable.reset_config()` to reset trial.
+        """Tries to invoke `Trainable.reset()` to reset trial.
 
         Args:
             trial (Trial): Trial to be reset.
@@ -137,7 +144,7 @@ class TrialExecutor(object):
                 for trial.
 
         Returns:
-            True if `reset_config` is successful else False.
+            True if `reset` is successful else False.
         """
         raise NotImplementedError
 
@@ -160,17 +167,22 @@ class TrialExecutor(object):
         for trial in trial_runner.get_trials():
             if trial.status == Trial.PENDING:
                 if not self.has_resources(trial.resources):
+                    resource_string = trial.resources.summary_string()
+                    trial_resource_help_msg = trial.get_trainable_cls(
+                    ).resource_help(trial.config)
+                    autoscaling_msg = ""
+                    if is_ray_cluster():
+                        autoscaling_msg = (
+                            "Pass `queue_trials=True` in ray.tune.run() or "
+                            "on the command line to queue trials until the "
+                            "cluster scales up or resources become available. "
+                        )
                     raise TuneError(
-                        ("Insufficient cluster resources to launch trial: "
-                         "trial requested {} but the cluster has only {}. "
-                         "Pass `queue_trials=True` in "
-                         "ray.tune.run() or on the command "
-                         "line to queue trials until the cluster scales "
-                         "up or resources become available. {}").format(
-                             trial.resources.summary_string(),
-                             self.resource_string(),
-                             trial.get_trainable_cls().resource_help(
-                                 trial.config)))
+                        "Insufficient cluster resources to launch trial: "
+                        f"trial requested {resource_string}, but the cluster "
+                        f"has only {self.resource_string()}. "
+                        f"{autoscaling_msg}"
+                        f"{trial_resource_help_msg} ")
             elif trial.status == Trial.PAUSED:
                 raise TuneError("There are paused trials, but no more pending "
                                 "trials with sufficient resources.")
@@ -197,7 +209,7 @@ class TrialExecutor(object):
 
         Assumes the trial is running.
 
-        Return:
+        Returns:
             Result object for the trial.
         """
         raise NotImplementedError
@@ -210,7 +222,7 @@ class TrialExecutor(object):
         """Returns a string describing the total resources available."""
         raise NotImplementedError
 
-    def restore(self, trial, checkpoint=None):
+    def restore(self, trial, checkpoint=None, block=False):
         """Restores training state from a checkpoint.
 
         If checkpoint is None, try to restore from trial.checkpoint.
@@ -219,26 +231,27 @@ class TrialExecutor(object):
         Args:
             trial (Trial): Trial to be restored.
             checkpoint (Checkpoint): Checkpoint to restore from.
+            block (bool): Whether or not to block on restore before returning.
 
-        Return:
+        Returns:
             False if error occurred, otherwise return True.
         """
         raise NotImplementedError("Subclasses of TrialExecutor must provide "
                                   "restore() method")
 
-    def save(self, trial, storage=Checkpoint.DISK, result=None):
+    def save(self, trial, storage=Checkpoint.PERSISTENT, result=None):
         """Saves training state of this trial to a checkpoint.
 
         If result is None, this trial's last result will be used.
 
         Args:
             trial (Trial): The state of this trial to be saved.
-            storage (str): Where to store the checkpoint. Defaults to DISK.
+            storage (str): Where to store the checkpoint. Defaults to
+                PERSISTENT.
             result (dict): The state of this trial as a dictionary to be saved.
 
-        Return:
-            A Python object if storage==Checkpoint.MEMORY otherwise
-            a path to the checkpoint.
+        Returns:
+            A Checkpoint object.
         """
         raise NotImplementedError("Subclasses of TrialExecutor must provide "
                                   "save() method")
@@ -249,7 +262,7 @@ class TrialExecutor(object):
         Args:
             trial (Trial): The state of this trial to be saved.
 
-        Return:
+        Returns:
             A dict that maps ExportFormats to successfully exported models.
         """
         raise NotImplementedError("Subclasses of TrialExecutor must provide "
@@ -258,3 +271,7 @@ class TrialExecutor(object):
     def has_gpus(self):
         """Returns True if GPUs are detected on the cluster."""
         return None
+
+    def cleanup(self, trial):
+        """Ensures that trials are cleaned up after stopping."""
+        pass

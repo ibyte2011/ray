@@ -1,23 +1,18 @@
 """Note: Keep in sync with changes to VTraceTFPolicy."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import ray
 from ray.rllib.policy.sample_batch import SampleBatch
-from ray.rllib.utils.explained_variance import explained_variance
 from ray.rllib.evaluation.postprocessing import compute_advantages, \
     Postprocessing
 from ray.rllib.policy.tf_policy_template import build_tf_policy
 from ray.rllib.policy.tf_policy import LearningRateSchedule
-from ray.rllib.utils.tf_ops import make_tf_callable
-from ray.rllib.utils import try_import_tf
+from ray.rllib.utils.framework import try_import_tf
+from ray.rllib.utils.tf_ops import explained_variance, make_tf_callable
 
-tf = try_import_tf()
+tf1, tf, tfv = try_import_tf()
 
 
-class A3CLoss(object):
+class A3CLoss:
     def __init__(self,
                  action_dist,
                  actions,
@@ -32,7 +27,7 @@ class A3CLoss(object):
         self.pi_loss = -tf.reduce_sum(log_prob * advantages)
 
         delta = vf - v_target
-        self.vf_loss = 0.5 * tf.reduce_sum(tf.square(delta))
+        self.vf_loss = 0.5 * tf.reduce_sum(tf.math.square(delta))
         self.entropy = tf.reduce_sum(action_dist.entropy())
         self.total_loss = (self.pi_loss + self.vf_loss * vf_loss_coeff -
                            self.entropy * entropy_coeff)
@@ -60,20 +55,21 @@ def postprocess_advantages(policy,
     else:
         next_state = []
         for i in range(policy.num_state_tensors()):
-            next_state.append([sample_batch["state_out_{}".format(i)][-1]])
+            next_state.append(sample_batch["state_out_{}".format(i)][-1])
         last_r = policy._value(sample_batch[SampleBatch.NEXT_OBS][-1],
                                sample_batch[SampleBatch.ACTIONS][-1],
                                sample_batch[SampleBatch.REWARDS][-1],
                                *next_state)
-    return compute_advantages(sample_batch, last_r, policy.config["gamma"],
-                              policy.config["lambda"])
+    return compute_advantages(
+        sample_batch, last_r, policy.config["gamma"], policy.config["lambda"],
+        policy.config["use_gae"], policy.config["use_critic"])
 
 
 def add_value_function_fetch(policy):
     return {SampleBatch.VF_PREDS: policy.model.value_function()}
 
 
-class ValueNetworkMixin(object):
+class ValueNetworkMixin:
     def __init__(self):
         @make_tf_callable(self.get_session())
         def value(ob, prev_action, prev_reward, *state):
@@ -94,7 +90,7 @@ def stats(policy, train_batch):
         "cur_lr": tf.cast(policy.cur_lr, tf.float64),
         "policy_loss": policy.loss.pi_loss,
         "policy_entropy": policy.loss.entropy,
-        "var_gnorm": tf.global_norm(
+        "var_gnorm": tf.linalg.global_norm(
             list(policy.model.trainable_variables())),
         "vf_loss": policy.loss.vf_loss,
     }
@@ -102,7 +98,7 @@ def stats(policy, train_batch):
 
 def grad_stats(policy, train_batch, grads):
     return {
-        "grad_gnorm": tf.global_norm(grads),
+        "grad_gnorm": tf.linalg.global_norm(grads),
         "vf_explained_var": explained_variance(
             train_batch[Postprocessing.VALUE_TARGETS],
             policy.model.value_function()),

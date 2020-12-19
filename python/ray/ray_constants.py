@@ -1,6 +1,3 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 """Ray constants used in the Python code."""
 
 import logging
@@ -16,21 +13,19 @@ def env_integer(key, default):
     return default
 
 
-def direct_call_enabled():
-    return bool(int(os.environ.get("RAY_FORCE_DIRECT", "1")))
+def env_bool(key, default):
+    if key in os.environ:
+        return True if os.environ[key].lower() == "true" else False
+    return default
 
 
 ID_SIZE = 20
 
 # The default maximum number of bytes to allocate to the object store unless
 # overridden by the user.
-DEFAULT_OBJECT_STORE_MAX_MEMORY_BYTES = 20 * 10**9
-# The default number of retries to call `put` when the object store is full.
-DEFAULT_PUT_OBJECT_RETRIES = 5
-# The default seconds for delay between calls to retry `put` when
-# the object store is full. This delay is exponentially doubled up to
-# DEFAULT_PUT_OBJECT_RETRIES times.
-DEFAULT_PUT_OBJECT_DELAY = 1
+DEFAULT_OBJECT_STORE_MAX_MEMORY_BYTES = 200 * 10**9
+# The default proportion of available memory allocated to the object store
+DEFAULT_OBJECT_STORE_MEMORY_PROPORTION = 0.3
 # The smallest cap on the memory used by the object store that we allow.
 # This must be greater than MEMORY_RESOURCE_UNIT_BYTES * 0.7
 OBJECT_STORE_MINIMUM_MEMORY_BYTES = 75 * 1024 * 1024
@@ -39,7 +34,13 @@ OBJECT_STORE_MINIMUM_MEMORY_BYTES = 75 * 1024 * 1024
 DEFAULT_REDIS_MAX_MEMORY_BYTES = 10**10
 # The smallest cap on the memory used by Redis that we allow.
 REDIS_MINIMUM_MEMORY_BYTES = 10**7
+# If a user does not specify a port for the primary Ray service,
+# we attempt to start the service running at this port.
+DEFAULT_PORT = 6379
 
+DEFAULT_DASHBOARD_IP = "127.0.0.1"
+DEFAULT_DASHBOARD_PORT = 8265
+PROMETHEUS_SERVICE_DISCOVERY_FILE = "prom_metrics_service_discovery.json"
 # Default resource requirements for actors when no resource requirements are
 # specified.
 DEFAULT_ACTOR_METHOD_CPU_SIMPLE = 1
@@ -62,7 +63,7 @@ DUPLICATE_REMOTE_FUNCTION_THRESHOLD = 100
 # The maximum resource quantity that is allowed. TODO(rkn): This could be
 # relaxed, but the current implementation of the node manager will be slower
 # for large resource quantities due to bookkeeping of specific resource IDs.
-MAX_RESOURCE_QUANTITY = 40000
+MAX_RESOURCE_QUANTITY = 100000
 
 # Each memory "resource" counts as this many bytes of memory.
 MEMORY_RESOURCE_UNIT_BYTES = 50 * 1024 * 1024
@@ -126,73 +127,95 @@ REMOVED_NODE_ERROR = "node_removed"
 MONITOR_DIED_ERROR = "monitor_died"
 LOG_MONITOR_DIED_ERROR = "log_monitor_died"
 REPORTER_DIED_ERROR = "reporter_died"
+DASHBOARD_AGENT_DIED_ERROR = "dashboard_agent_died"
 DASHBOARD_DIED_ERROR = "dashboard_died"
 RAYLET_CONNECTION_ERROR = "raylet_connection_error"
 
-# Abort autoscaling if more than this number of errors are encountered. This
-# is a safety feature to prevent e.g. runaway node launches.
-AUTOSCALER_MAX_NUM_FAILURES = env_integer("AUTOSCALER_MAX_NUM_FAILURES", 5)
+# Used in gpu detection
+RESOURCE_CONSTRAINT_PREFIX = "accelerator_type:"
 
-# The maximum number of nodes to launch in a single request.
-# Multiple requests may be made for this batch size, up to
-# the limit of AUTOSCALER_MAX_CONCURRENT_LAUNCHES.
-AUTOSCALER_MAX_LAUNCH_BATCH = env_integer("AUTOSCALER_MAX_LAUNCH_BATCH", 5)
+RESOURCES_ENVIRONMENT_VARIABLE = "RAY_OVERRIDE_RESOURCES"
 
-# Max number of nodes to launch at a time.
-AUTOSCALER_MAX_CONCURRENT_LAUNCHES = env_integer(
-    "AUTOSCALER_MAX_CONCURRENT_LAUNCHES", 10)
+# The reporter will report its statistics this often (milliseconds).
+REPORTER_UPDATE_INTERVAL_MS = env_integer("REPORTER_UPDATE_INTERVAL_MS", 2500)
 
-# Interval at which to perform autoscaling updates.
-AUTOSCALER_UPDATE_INTERVAL_S = env_integer("AUTOSCALER_UPDATE_INTERVAL_S", 5)
-
-# The autoscaler will attempt to restart Ray on nodes it hasn't heard from
-# in more than this interval.
-AUTOSCALER_HEARTBEAT_TIMEOUT_S = env_integer("AUTOSCALER_HEARTBEAT_TIMEOUT_S",
-                                             30)
-
-# The reporter will report its' statistics this often (milliseconds).
-REPORTER_UPDATE_INTERVAL_MS = env_integer("REPORTER_UPDATE_INTERVAL_MS", 500)
-
-# Max number of retries to AWS (default is 5, time increases exponentially)
-BOTO_MAX_RETRIES = env_integer("BOTO_MAX_RETRIES", 12)
-# Max number of retries to create an EC2 node (retry different subnet)
-BOTO_CREATE_MAX_RETRIES = env_integer("BOTO_CREATE_MAX_RETRIES", 5)
+# Number of attempts to ping the Redis server. See
+# `services.py:wait_for_redis_to_start`.
+START_REDIS_WAIT_RETRIES = env_integer("RAY_START_REDIS_WAIT_RETRIES", 12)
 
 LOGGER_FORMAT = (
     "%(asctime)s\t%(levelname)s %(filename)s:%(lineno)s -- %(message)s")
-LOGGER_FORMAT_HELP = "The logging format. default='{}'".format(LOGGER_FORMAT)
+LOGGER_FORMAT_HELP = f"The logging format. default='{LOGGER_FORMAT}'"
 LOGGER_LEVEL = "info"
 LOGGER_LEVEL_CHOICES = ["debug", "info", "warning", "error", "critical"]
 LOGGER_LEVEL_HELP = ("The logging level threshold, choices=['debug', 'info',"
                      " 'warning', 'error', 'critical'], default='info'")
-
-# A constant indicating that an actor doesn't need reconstructions.
-NO_RECONSTRUCTION = 0
-# A constant indicating that an actor should be reconstructed infinite times.
-INFINITE_RECONSTRUCTION = 2**30
+# Default param for RotatingFileHandler
+# maxBytes. 10G by default. We intentionally set the default value high
+# so that users who won't care don't know about the existence of this.
+LOGGING_ROTATE_BYTES = 10 * 1000 * 1000 * 1000
+# The default will grow logs up until 500GB without log loss.
+LOGGING_ROTATE_BACKUP_COUNT = 50  # backupCount
 
 # Constants used to define the different process types.
 PROCESS_TYPE_REAPER = "reaper"
 PROCESS_TYPE_MONITOR = "monitor"
-PROCESS_TYPE_RAYLET_MONITOR = "raylet_monitor"
 PROCESS_TYPE_LOG_MONITOR = "log_monitor"
+# TODO(sang): Delete it.
 PROCESS_TYPE_REPORTER = "reporter"
 PROCESS_TYPE_DASHBOARD = "dashboard"
+PROCESS_TYPE_DASHBOARD_AGENT = "dashboard_agent"
 PROCESS_TYPE_WORKER = "worker"
 PROCESS_TYPE_RAYLET = "raylet"
 PROCESS_TYPE_PLASMA_STORE = "plasma_store"
 PROCESS_TYPE_REDIS_SERVER = "redis_server"
 PROCESS_TYPE_WEB_UI = "web_ui"
+PROCESS_TYPE_GCS_SERVER = "gcs_server"
+
+# Log file names
+MONITOR_LOG_FILE_NAME = f"{PROCESS_TYPE_MONITOR}.log"
+LOG_MONITOR_LOG_FILE_NAME = f"{PROCESS_TYPE_LOG_MONITOR}.log"
+
+WORKER_PROCESS_TYPE_IDLE_WORKER = "ray::IDLE"
+WORKER_PROCESS_TYPE_SPILL_WORKER_NAME = "SpillWorker"
+WORKER_PROCESS_TYPE_RESTORE_WORKER_NAME = "RestoreWorker"
+WORKER_PROCESS_TYPE_SPILL_WORKER_IDLE = (
+    f"ray::IDLE_{WORKER_PROCESS_TYPE_SPILL_WORKER_NAME}")
+WORKER_PROCESS_TYPE_RESTORE_WORKER_IDLE = (
+    f"ray::IDLE_{WORKER_PROCESS_TYPE_RESTORE_WORKER_NAME}")
+WORKER_PROCESS_TYPE_SPILL_WORKER = (
+    f"ray::SPILL_{WORKER_PROCESS_TYPE_SPILL_WORKER_NAME}")
+WORKER_PROCESS_TYPE_RESTORE_WORKER = (
+    f"ray::RESTORE_{WORKER_PROCESS_TYPE_RESTORE_WORKER_NAME}")
+WORKER_PROCESS_TYPE_SPILL_WORKER_DELETE = (
+    f"ray::DELETE_{WORKER_PROCESS_TYPE_SPILL_WORKER_NAME}")
+WORKER_PROCESS_TYPE_RESTORE_WORKER_DELETE = (
+    f"ray::DELETE_{WORKER_PROCESS_TYPE_RESTORE_WORKER_NAME}")
 
 LOG_MONITOR_MAX_OPEN_FILES = 200
 
-# A constant used as object metadata to indicate the object is raw binary.
-RAW_BUFFER_METADATA = b"RAW"
-# A constant used as object metadata to indicate the object is pickled. This
-# format is only ever used for Python inline task argument values.
-PICKLE_BUFFER_METADATA = b"PICKLE"
-# A constant used as object metadata to indicate the object is pickle5 format.
-PICKLE5_BUFFER_METADATA = b"PICKLE5"
+# The object metadata field uses the following format: It is a comma
+# separated list of fields. The first field is mandatory and is the
+# type of the object (see types below) or an integer, which is interpreted
+# as an error value. The second part is optional and if present has the
+# form DEBUG:<breakpoint_id>, it is used for implementing the debugger.
+
+# A constant used as object metadata to indicate the object is cross language.
+OBJECT_METADATA_TYPE_CROSS_LANGUAGE = b"XLANG"
+# A constant used as object metadata to indicate the object is python specific.
+OBJECT_METADATA_TYPE_PYTHON = b"PYTHON"
+# A constant used as object metadata to indicate the object is raw bytes.
+OBJECT_METADATA_TYPE_RAW = b"RAW"
+
+# A constant used as object metadata to indicate the object is an actor handle.
+# This value should be synchronized with the Java definition in
+# ObjectSerializer.java
+# TODO(fyrestone): Serialize the ActorHandle via the custom type feature
+# of XLANG.
+OBJECT_METADATA_TYPE_ACTOR_HANDLE = b"ACTOR_HANDLE"
+
+# A constant indicating the debugging part of the metadata (see above).
+OBJECT_METADATA_DEBUG_PREFIX = b"DEBUG:"
 
 AUTOSCALER_RESOURCE_REQUEST_CHANNEL = b"autoscaler_resource_request"
 
@@ -202,3 +225,13 @@ REDIS_DEFAULT_PASSWORD = "5241590000000000"
 
 # The default ip address to bind to.
 NODE_DEFAULT_IP = "127.0.0.1"
+
+# The Mach kernel page size in bytes.
+MACH_PAGE_SIZE_BYTES = 4096
+
+# Max 64 bit integer value, which is needed to ensure against overflow
+# in C++ when passing integer values cross-language.
+MAX_INT64_VALUE = 9223372036854775807
+
+# Object Spilling related constants
+DEFAULT_OBJECT_PREFIX = "ray_spilled_object"

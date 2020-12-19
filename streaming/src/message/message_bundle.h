@@ -1,11 +1,13 @@
-#ifndef RAY_MESSAGE_BUNDLE_H
-#define RAY_MESSAGE_BUNDLE_H
+#pragma once
 
 #include <ctime>
 #include <list>
+#include <memory>
 #include <numeric>
+#include <string>
 
-#include "message.h"
+#include "message/message.h"
+#include "ray/common/id.h"
 
 namespace ray {
 namespace streaming {
@@ -44,15 +46,29 @@ class StreamingMessageBundleMeta {
 
   StreamingMessageBundleType bundle_type_;
 
+ private:
+  /// To speed up memory copy and serilization, we use memory layout of compiler related
+  /// member variables. It's must be modified if any field is going to be inserted before
+  /// first member property.
+  /// Reference
+  /// :/http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2018/p1113r0.html#2254).
+  inline uint8_t *GetFirstMemberAddress() {
+    return reinterpret_cast<uint8_t *>(&message_bundle_ts_);
+  }
+
  public:
-  explicit StreamingMessageBundleMeta(uint64_t, uint64_t, uint32_t,
-                                      StreamingMessageBundleType);
+  explicit StreamingMessageBundleMeta(const uint8_t *bytes);
+
+  explicit StreamingMessageBundleMeta(const uint64_t message_bunddle_tes,
+                                      const uint64_t last_offset_seq_id,
+                                      const uint32_t message_list_size,
+                                      const StreamingMessageBundleType bundle_type);
 
   explicit StreamingMessageBundleMeta(StreamingMessageBundleMeta *);
 
   explicit StreamingMessageBundleMeta();
 
-  virtual ~StreamingMessageBundleMeta(){};
+  virtual ~StreamingMessageBundleMeta() = default;
 
   bool operator==(StreamingMessageBundleMeta &) const;
 
@@ -68,24 +84,31 @@ class StreamingMessageBundleMeta {
 
   inline bool IsBarrier() { return StreamingMessageBundleType::Barrier == bundle_type_; }
   inline bool IsBundle() { return StreamingMessageBundleType::Bundle == bundle_type_; }
+  inline bool IsEmptyMsg() { return StreamingMessageBundleType::Empty == bundle_type_; }
 
   virtual void ToBytes(uint8_t *data);
   static StreamingMessageBundleMetaPtr FromBytes(const uint8_t *data,
                                                  bool verifer_check = true);
   inline virtual uint32_t ClassBytesSize() { return kMessageBundleMetaHeaderSize; }
 
+  inline static bool CheckBundleMagicNum(const uint8_t *bytes) {
+    const uint32_t *magic_num = reinterpret_cast<const uint32_t *>(bytes);
+    return *magic_num == StreamingMessageBundleMagicNum;
+  }
+
   std::string ToString() {
     return std::to_string(last_message_id_) + "," + std::to_string(message_list_size_) +
            "," + std::to_string(message_bundle_ts_) + "," +
            std::to_string(static_cast<uint32_t>(bundle_type_));
   }
+
+  friend std::ostream &operator<<(std::ostream &os,
+                                  const StreamingMessageBundleMeta &meta);
 };
 
-/// StreamingMessageBundle inherits from metadata class (StreamingMessageBundleMeta) with
-/// the following protocol:
-/// MagicNum = 0xcafebaba
-/// Timestamp 64bits timestamp (milliseconds from 1970)
-/// LastMessageId( the last id of bundle) (0,INF]
+/// StreamingMessageBundle inherits from metadata class (StreamingMessageBundleMeta)
+/// with the following protocol: MagicNum = 0xcafebaba Timestamp 64bits timestamp
+/// (milliseconds from 1970) LastMessageId( the last id of bundle) (0,INF]
 /// MessageListSize(bundle len of message)
 /// BundleType(a. bundle = 3 , b. barrier =2, c. empty = 1)
 /// RawBundleSize（binary length of data)
@@ -154,11 +177,35 @@ class StreamingMessageBundle : public StreamingMessageBundleMeta {
   static void GetMessageListFromRawData(const uint8_t *bytes, uint32_t bytes_size,
                                         uint32_t message_list_size,
                                         std::list<StreamingMessagePtr> &message_list);
+
   static void ConvertMessageListToRawData(
       const std::list<StreamingMessagePtr> &message_list, uint32_t raw_data_size,
       uint8_t *raw_data);
 };
+
+/// Databundle is super-bundle that contains channel information (upstream
+/// channel id & bundle meta data) and raw buffer pointer.
+struct DataBundle {
+  uint8_t *data = nullptr;
+  uint32_t data_size;
+  ObjectID from;
+  uint32_t last_barrier_id;
+  StreamingMessageBundleMetaPtr meta;
+  bool is_reallocated = false;
+
+  ~DataBundle() {
+    if (is_reallocated) {
+      delete[] data;
+    }
+  }
+
+  void Realloc(uint32_t size) {
+    data = new uint8_t[size];
+    is_reallocated = true;
+  }
+
+  friend std::ostream &operator<<(std::ostream &os, const DataBundle &bundle);
+};
+
 }  // namespace streaming
 }  // namespace ray
-
-#endif  // RAY_MESSAGE_BUNDLE_H

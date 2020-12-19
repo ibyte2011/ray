@@ -1,19 +1,15 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import logging
 import os
 import time
 
-from ray.rllib.utils.debug import log_once
-from ray.rllib.utils import try_import_tf
+from ray.util.debug import log_once
+from ray.rllib.utils.framework import try_import_tf
 
-tf = try_import_tf()
+tf1, tf, tfv = try_import_tf()
 logger = logging.getLogger(__name__)
 
 
-class TFRunBuilder(object):
+class TFRunBuilder:
     """Used to incrementally build up a TensorFlow run.
 
     This is particularly useful for batching ops from multiple different
@@ -46,11 +42,10 @@ class TFRunBuilder(object):
                 self._executed = run_timeline(
                     self.session, self.fetches, self.debug_name,
                     self.feed_dict, os.environ.get("TF_TIMELINE_DIR"))
-            except Exception:
+            except Exception as e:
                 logger.exception("Error fetching: {}, feed_dict={}".format(
                     self.fetches, self.feed_dict))
-                raise ValueError("Error fetching: {}, feed_dict={}".format(
-                    self.fetches, self.feed_dict))
+                raise e
         if isinstance(to_fetch, int):
             return self._executed[to_fetch]
         elif isinstance(to_fetch, list):
@@ -68,8 +63,8 @@ def run_timeline(sess, ops, debug_name, feed_dict={}, timeline_dir=None):
     if timeline_dir:
         from tensorflow.python.client import timeline
 
-        run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
-        run_metadata = tf.RunMetadata()
+        run_options = tf1.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+        run_metadata = tf1.RunMetadata()
         start = time.time()
         fetches = sess.run(
             ops,

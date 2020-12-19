@@ -1,34 +1,36 @@
+// Copyright 2017 The Ray Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//  http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include <iostream>
 #include <thread>
 
 #include "gtest/gtest.h"
-
 #include "ray/common/status.h"
-
+#include "ray/common/test_util.h"
 #include "ray/raylet/raylet.h"
+#include "ray/util/filesystem.h"
 
 namespace ray {
 
 namespace raylet {
 
 std::string test_executable;
-std::string store_executable;
 
 // TODO(hme): Get this working once the dust settles.
 class TestObjectManagerBase : public ::testing::Test {
  public:
   TestObjectManagerBase() { RAY_LOG(INFO) << "TestObjectManagerBase: started."; }
-
-  std::string StartStore(const std::string &id) {
-    std::string store_id = "/tmp/store";
-    store_id = store_id + id;
-    std::string plasma_command = store_executable + " -m 1000000000 -s " + store_id +
-                                 " 1> /dev/null 2> /dev/null &";
-    RAY_LOG(INFO) << plasma_command;
-    int ec = system(plasma_command.c_str());
-    RAY_CHECK(ec == 0);
-    return store_id;
-  }
 
   NodeManagerConfig GetNodeManagerConfig(std::string raylet_socket_name,
                                          std::string store_socket_name) {
@@ -38,7 +40,6 @@ class TestObjectManagerBase : public ::testing::Test {
     static_resource_conf = {{"CPU", 1}, {"GPU", 1}};
     node_manager_config.resource_config =
         ray::raylet::ResourceSet(std::move(static_resource_conf));
-    node_manager_config.num_initial_workers = 0;
     // Use a default worker that can execute empty tasks with dependencies.
     std::vector<std::string> py_worker_command;
     py_worker_command.push_back("python");
@@ -51,8 +52,8 @@ class TestObjectManagerBase : public ::testing::Test {
 
   void SetUp() {
     // start store
-    std::string store_sock_1 = StartStore("1");
-    std::string store_sock_2 = StartStore("2");
+    std::string store_sock_1 = TestSetupUtil::StartObjectStore("1");
+    std::string store_sock_2 = TestSetupUtil::StartObjectStore("2");
 
     // start first server
     gcs::GcsClientOptions client_options("127.0.0.1", 6379, /*password*/ "", true);
@@ -76,26 +77,23 @@ class TestObjectManagerBase : public ::testing::Test {
         GetNodeManagerConfig("raylet_2", store_sock_2), om_config_2, gcs_client_2));
 
     // connect to stores.
-    RAY_ARROW_CHECK_OK(client1.Connect(store_sock_1));
-    RAY_ARROW_CHECK_OK(client2.Connect(store_sock_2));
+    RAY_CHECK_OK(client1.Connect(store_sock_1));
+    RAY_CHECK_OK(client2.Connect(store_sock_2));
   }
 
   void TearDown() {
-    arrow::Status client1_status = client1.Disconnect();
-    arrow::Status client2_status = client2.Disconnect();
+    Status client1_status = client1.Disconnect();
+    Status client2_status = client2.Disconnect();
     ASSERT_TRUE(client1_status.ok() && client2_status.ok());
 
     this->server1.reset();
     this->server2.reset();
 
-    int s = system("killall plasma_store_server &");
-    ASSERT_TRUE(!s);
+    ASSERT_EQ(TestSetupUtil::KillAllExecutable(plasma_store_server + GetExeSuffix()), 0);
 
     std::string cmd_str = test_executable.substr(0, test_executable.find_last_of("/"));
-    s = system(("rm " + cmd_str + "/raylet_1").c_str());
-    ASSERT_TRUE(!s);
-    s = system(("rm " + cmd_str + "/raylet_2").c_str());
-    ASSERT_TRUE(!s);
+    ASSERT_EQ(unlink((cmd_str + "/raylet_1").c_str()), 0);
+    ASSERT_EQ(unlink((cmd_str + "/raylet_2").c_str()), 0);
   }
 
   ObjectID WriteDataToClient(plasma::PlasmaClient &client, int64_t data_size) {
@@ -104,9 +102,8 @@ class TestObjectManagerBase : public ::testing::Test {
     uint8_t metadata[] = {5};
     int64_t metadata_size = sizeof(metadata);
     std::shared_ptr<Buffer> data;
-    RAY_ARROW_CHECK_OK(
-        client.Create(object_id.ToPlasmaId(), data_size, metadata, metadata_size, &data));
-    RAY_ARROW_CHECK_OK(client.Seal(object_id.ToPlasmaId()));
+    RAY_CHECK_OK(client.Create(object_id, data_size, metadata, metadata_size, &data));
+    RAY_CHECK_OK(client.Seal(object_id));
     return object_id;
   }
 
@@ -130,23 +127,22 @@ class TestObjectManagerIntegration : public TestObjectManagerBase {
 
   int num_connected_clients = 0;
 
-  ClientID client_id_1;
-  ClientID client_id_2;
+  NodeID node_id_1;
+  NodeID node_id_2;
 
   void WaitConnections() {
-    client_id_1 = gcs_client_1->client_table().GetLocalClientId();
-    client_id_2 = gcs_client_2->client_table().GetLocalClientId();
-    gcs_client_1->client_table().RegisterClientAddedCallback(
-        [this](gcs::RedisGcsClient *client, const ClientID &id,
-               const rpc::GcsNodeInfo &data) {
-          ClientID parsed_id = ClientID::FromBinary(data.node_id);
-          if (parsed_id == client_id_1 || parsed_id == client_id_2) {
+    node_id_1 = gcs_client_1->Nodes().GetSelfId();
+    node_id_2 = gcs_client_2->Nodes().GetSelfId();
+    gcs_client_1->Nodes().AsyncSubscribeToNodeChange(
+        [this](const NodeID &node_id, const rpc::GcsNodeInfo &data) {
+          if (node_id == node_id_1 || node_id == node_id_2) {
             num_connected_clients += 1;
           }
           if (num_connected_clients == 2) {
             StartTests();
           }
-        });
+        },
+        nullptr);
   }
 
   void StartTests() {
@@ -180,7 +176,7 @@ class TestObjectManagerIntegration : public TestObjectManagerBase {
 
     num_expected_objects = (size_t)1;
     ObjectID oid1 = WriteDataToClient(client1, data_size);
-    server1->object_manager_.Push(oid1, client_id_2);
+    server1->object_manager_.Push(oid1, node_id_2);
   }
 
   void TestPushComplete() {
@@ -199,25 +195,24 @@ class TestObjectManagerIntegration : public TestObjectManagerBase {
     RAY_LOG(INFO) << "\n"
                   << "Server client ids:"
                   << "\n";
-    ClientID client_id_1 = gcs_client_1->client_table().GetLocalClientId();
-    ClientID client_id_2 = gcs_client_2->client_table().GetLocalClientId();
-    RAY_LOG(INFO) << "Server 1: " << client_id_1;
-    RAY_LOG(INFO) << "Server 2: " << client_id_2;
+    NodeID node_id_1 = gcs_client_1->Nodes().GetSelfId();
+    NodeID node_id_2 = gcs_client_2->Nodes().GetSelfId();
+    RAY_LOG(INFO) << "Server 1: " << node_id_1;
+    RAY_LOG(INFO) << "Server 2: " << node_id_2;
 
     RAY_LOG(INFO) << "\n"
                   << "All connected clients:"
                   << "\n";
-    rpc::GcsNodeInfo data;
-    gcs_client_2->client_table().GetClient(client_id_1, data);
-    RAY_LOG(INFO) << (ClientID::FromBinary(data.node_id()).IsNil());
-    RAY_LOG(INFO) << "ClientID=" << ClientID::FromBinary(data.node_id());
-    RAY_LOG(INFO) << "ClientIp=" << data.node_manager_address();
-    RAY_LOG(INFO) << "ClientPort=" << data.node_manager_port();
+    auto data = gcs_client_2->Nodes().Get(node_id_1);
+    RAY_LOG(INFO) << (NodeID::FromBinary(data->node_id()).IsNil());
+    RAY_LOG(INFO) << "NodeID=" << NodeID::FromBinary(data->node_id());
+    RAY_LOG(INFO) << "ClientIp=" << data->node_manager_address();
+    RAY_LOG(INFO) << "ClientPort=" << data->node_manager_port();
     rpc::GcsNodeInfo data2;
-    gcs_client_1->client_table().GetClient(client_id_2, data2);
-    RAY_LOG(INFO) << "ClientID=" << ClientID::FromBinary(data2.node_id());
-    RAY_LOG(INFO) << "ClientIp=" << data2.node_manager_address();
-    RAY_LOG(INFO) << "ClientPort=" << data2.node_manager_port();
+    gcs_client_1->Nodes().Get(node_id_2);
+    RAY_LOG(INFO) << "NodeID=" << NodeID::FromBinary(data2->node_id());
+    RAY_LOG(INFO) << "ClientIp=" << data2->node_manager_address();
+    RAY_LOG(INFO) << "ClientPort=" << data2->node_manager_port();
   }
 };
 
@@ -234,6 +229,6 @@ TEST_F(TestObjectManagerIntegration, StartTestObjectManagerPush) {
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   ray::raylet::test_executable = std::string(argv[0]);
-  ray::raylet::store_executable = std::string(argv[1]);
+  ray::TEST_STORE_EXEC_PATH = std::string(argv[1]);
   return RUN_ALL_TESTS();
 }

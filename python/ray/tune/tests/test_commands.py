@@ -1,7 +1,3 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import click
 import os
 import pytest
@@ -20,7 +16,7 @@ from ray.tune import commands
 from ray.tune.result import CONFIG_PREFIX
 
 
-class Capturing(object):
+class Capturing:
     def __enter__(self):
         self._stdout = sys.stdout
         sys.stdout = self._stringio = StringIO()
@@ -61,7 +57,7 @@ def test_time(start_ray, tmpdir):
         subprocess.check_call(["tune", "ls", experiment_path])
         times += [time.time() - start]
 
-    assert sum(times) / len(times) < 2.0, "CLI is taking too long!"
+    assert sum(times) / len(times) < 3.0, "CLI is taking too long!"
 
 
 def test_ls(start_ray, tmpdir):

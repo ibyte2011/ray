@@ -1,12 +1,11 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import numpy as np
 
 from ray.rllib.offline.input_reader import InputReader
 from ray.rllib.offline.json_reader import JsonReader
+from ray.rllib.offline.io_context import IOContext
 from ray.rllib.utils.annotations import override, DeveloperAPI
+from ray.rllib.utils.typing import SampleBatchType
+from typing import Dict
 
 
 @DeveloperAPI
@@ -22,10 +21,10 @@ class MixedInput(InputReader):
     """
 
     @DeveloperAPI
-    def __init__(self, dist, ioctx):
+    def __init__(self, dist: Dict[JsonReader, float], ioctx: IOContext):
         """Initialize a MixedInput.
 
-        Arguments:
+        Args:
             dist (dict): dict mapping JSONReader paths or "sampler" to
                 probabilities. The probabilities must sum to 1.0.
             ioctx (IOContext): current IO context object.
@@ -38,10 +37,10 @@ class MixedInput(InputReader):
             if k == "sampler":
                 self.choices.append(ioctx.default_sampler_input())
             else:
-                self.choices.append(JsonReader(k))
+                self.choices.append(JsonReader(k, ioctx))
             self.p.append(v)
 
     @override(InputReader)
-    def next(self):
+    def next(self) -> SampleBatchType:
         source = np.random.choice(self.choices, p=self.p)
         return source.next()

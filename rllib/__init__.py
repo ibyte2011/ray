@@ -1,9 +1,4 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import logging
-import sys
 
 # Note: do not introduce unnecessary library dependencies here, e.g. gym.
 # This file is imported from the tune module in order to register RLlib agents.
@@ -11,13 +6,11 @@ from ray.rllib.env.base_env import BaseEnv
 from ray.rllib.env.external_env import ExternalEnv
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from ray.rllib.env.vector_env import VectorEnv
-from ray.rllib.evaluation.policy_graph import PolicyGraph
 from ray.rllib.evaluation.rollout_worker import RolloutWorker
-from ray.rllib.evaluation.tf_policy_graph import TFPolicyGraph
 from ray.rllib.policy.policy import Policy
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.policy.tf_policy import TFPolicy
-
+from ray.rllib.policy.torch_policy import TorchPolicy
 from ray.tune.registry import register_trainable
 
 
@@ -30,11 +23,6 @@ def _setup_logger():
         ))
     logger.addHandler(handler)
     logger.propagate = False
-
-    if sys.version_info[0] < 3:
-        logger.warning(
-            "RLlib Python 2 support is deprecated, and will be removed "
-            "in a future release.")
 
 
 def _register_all():
@@ -53,7 +41,7 @@ def _register_all():
             _name = "SeeContrib"
             _default_config = with_common_config({})
 
-            def _setup(self, config):
+            def setup(self, config):
                 raise NameError(
                     "Please run `contrib/{}` instead.".format(name))
 
@@ -71,11 +59,9 @@ _register_all()
 
 __all__ = [
     "Policy",
-    "PolicyGraph",
     "TFPolicy",
-    "TFPolicyGraph",
+    "TorchPolicy",
     "RolloutWorker",
-    "PolicyEvaluator",
     "SampleBatch",
     "BaseEnv",
     "MultiAgentEnv",

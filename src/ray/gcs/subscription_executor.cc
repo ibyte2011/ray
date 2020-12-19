@@ -1,3 +1,17 @@
+// Copyright 2017 The Ray Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//  http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include "ray/gcs/subscription_executor.h"
 
 namespace ray {
@@ -6,7 +20,7 @@ namespace gcs {
 
 template <typename ID, typename Data, typename Table>
 Status SubscriptionExecutor<ID, Data, Table>::AsyncSubscribeAll(
-    const ClientID &client_id, const SubscribeCallback<ID, Data> &subscribe,
+    const NodeID &node_id, const SubscribeCallback<ID, Data> &subscribe,
     const StatusCallback &done) {
   // TODO(micafan) Optimize the lock when necessary.
   // Consider avoiding locking in single-threaded processes.
@@ -52,8 +66,6 @@ Status SubscriptionExecutor<ID, Data, Table>::AsyncSubscribeAll(
       return;
     }
 
-    RAY_LOG(DEBUG) << "Subscribe received update of id " << id;
-
     SubscribeCallback<ID, Data> sub_one_callback = nullptr;
     SubscribeCallback<ID, Data> sub_all_callback = nullptr;
     {
@@ -87,7 +99,7 @@ Status SubscriptionExecutor<ID, Data, Table>::AsyncSubscribeAll(
     }
   };
 
-  Status status = table_.Subscribe(JobID::Nil(), client_id, on_subscribe, on_done);
+  Status status = table_.Subscribe(JobID::Nil(), node_id, on_subscribe, on_done);
   if (status.ok()) {
     registration_status_ = RegistrationStatus::kRegistering;
     subscribe_all_callback_ = subscribe;
@@ -98,15 +110,15 @@ Status SubscriptionExecutor<ID, Data, Table>::AsyncSubscribeAll(
 
 template <typename ID, typename Data, typename Table>
 Status SubscriptionExecutor<ID, Data, Table>::AsyncSubscribe(
-    const ClientID &client_id, const ID &id, const SubscribeCallback<ID, Data> &subscribe,
+    const NodeID &node_id, const ID &id, const SubscribeCallback<ID, Data> &subscribe,
     const StatusCallback &done) {
-  RAY_CHECK(client_id != ClientID::Nil());
+  RAY_CHECK(node_id != NodeID::Nil());
 
   // NOTE(zhijunfu): `Subscribe` and other operations use different redis contexts,
   // thus we need to call `RequestNotifications` in the Subscribe callback to ensure
   // it's processed after the `Subscribe` request. Otherwise if `RequestNotifications`
   // is processed first we will miss the initial notification.
-  auto on_subscribe_done = [this, client_id, id, subscribe, done](Status status) {
+  auto on_subscribe_done = [this, node_id, id, subscribe, done](Status status) {
     auto on_request_notification_done = [this, done, id](Status status) {
       if (!status.ok()) {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -119,7 +131,7 @@ Status SubscriptionExecutor<ID, Data, Table>::AsyncSubscribe(
 
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      status = table_.RequestNotifications(JobID::Nil(), id, client_id,
+      status = table_.RequestNotifications(JobID::Nil(), id, node_id,
                                            on_request_notification_done);
       if (!status.ok()) {
         id_to_callback_map_.erase(id);
@@ -131,14 +143,13 @@ Status SubscriptionExecutor<ID, Data, Table>::AsyncSubscribe(
     std::unique_lock<std::mutex> lock(mutex_);
     const auto it = id_to_callback_map_.find(id);
     if (it != id_to_callback_map_.end()) {
-      RAY_LOG(DEBUG) << "Duplicate subscription to id " << id << " client_id "
-                     << client_id;
+      RAY_LOG(DEBUG) << "Duplicate subscription to id " << id << " node_id " << node_id;
       return Status::Invalid("Duplicate subscription to element!");
     }
     id_to_callback_map_[id] = subscribe;
   }
 
-  auto status = AsyncSubscribeAll(client_id, nullptr, on_subscribe_done);
+  auto status = AsyncSubscribeAll(node_id, nullptr, on_subscribe_done);
   if (!status.ok()) {
     std::unique_lock<std::mutex> lock(mutex_);
     id_to_callback_map_.erase(id);
@@ -148,13 +159,13 @@ Status SubscriptionExecutor<ID, Data, Table>::AsyncSubscribe(
 
 template <typename ID, typename Data, typename Table>
 Status SubscriptionExecutor<ID, Data, Table>::AsyncUnsubscribe(
-    const ClientID &client_id, const ID &id, const StatusCallback &done) {
+    const NodeID &node_id, const ID &id, const StatusCallback &done) {
   SubscribeCallback<ID, Data> subscribe = nullptr;
   {
     std::unique_lock<std::mutex> lock(mutex_);
     const auto it = id_to_callback_map_.find(id);
     if (it == id_to_callback_map_.end()) {
-      RAY_LOG(DEBUG) << "Invalid Unsubscribe! id " << id << " client_id " << client_id;
+      RAY_LOG(DEBUG) << "Invalid Unsubscribe! id " << id << " node_id " << node_id;
       return Status::Invalid("Invalid Unsubscribe, no existing subscription found.");
     }
     subscribe = std::move(it->second);
@@ -183,12 +194,21 @@ Status SubscriptionExecutor<ID, Data, Table>::AsyncUnsubscribe(
     }
   };
 
-  return table_.CancelNotifications(JobID::Nil(), id, client_id, on_done);
+  return table_.CancelNotifications(JobID::Nil(), id, node_id, on_done);
 }
 
+template class SubscriptionExecutor<ActorID, ActorTableData, LogBasedActorTable>;
 template class SubscriptionExecutor<ActorID, ActorTableData, ActorTable>;
-template class SubscriptionExecutor<ActorID, ActorTableData, DirectActorTable>;
 template class SubscriptionExecutor<JobID, JobTableData, JobTable>;
+template class SubscriptionExecutor<TaskID, TaskTableData, raylet::TaskTable>;
+template class SubscriptionExecutor<ObjectID, ObjectChangeNotification, ObjectTable>;
+template class SubscriptionExecutor<TaskID, boost::optional<TaskLeaseData>,
+                                    TaskLeaseTable>;
+template class SubscriptionExecutor<NodeID, ResourceChangeNotification,
+                                    DynamicResourceTable>;
+template class SubscriptionExecutor<NodeID, ResourceUsageBatchData,
+                                    ResourceUsageBatchTable>;
+template class SubscriptionExecutor<WorkerID, WorkerTableData, WorkerTable>;
 
 }  // namespace gcs
 

@@ -19,30 +19,59 @@ import os
 import urllib
 sys.path.insert(0, os.path.abspath('.'))
 from custom_directives import CustomGalleryItemDirective
+from datetime import datetime
 
 # These lines added to enable Sphinx to work without installing Ray.
 import mock
+
+
+class ChildClassMock(mock.MagicMock):
+    @classmethod
+    def __getattr__(cls, name):
+        return mock.Mock
+
+
 MOCK_MODULES = [
+    "ax",
+    "ax.service.ax_client",
     "blist",
+    "ConfigSpace",
     "gym",
     "gym.spaces",
+    "horovod",
+    "horovod.ray",
+    "kubernetes",
+    "mlflow",
+    "mxnet",
+    "mxnet.model",
+    "psutil",
+    "pytorch_lightning.core.step_result",
+    "pytorch_lightning.overrides.data_parallel",
+    "pytorch_lightning.utilities.model_utils",
+    "pytorch_lightning.trainer.model_hooks",
+    "pytorch_lightning.trainer.optimizers",
+    "pytorch_lightning.utilities.exceptions",
+    "pytorch_lightning.utilities.memory",
     "ray._raylet",
     "ray.core.generated",
+    "ray.core.generated.common_pb2",
     "ray.core.generated.gcs_pb2",
     "ray.core.generated.ray.protocol.Task",
-    "scipy",
     "scipy.signal",
     "scipy.stats",
+    "setproctitle",
     "tensorflow_probability",
     "tensorflow",
     "tensorflow.contrib",
     "tensorflow.contrib.all_reduce",
+    "tree",
     "tensorflow.contrib.all_reduce.python",
     "tensorflow.contrib.layers",
     "tensorflow.contrib.rnn",
     "tensorflow.contrib.slim",
     "tensorflow.core",
     "tensorflow.core.util",
+    "tensorflow.keras",
     "tensorflow.python",
     "tensorflow.python.client",
     "tensorflow.python.util",
@@ -51,17 +80,55 @@ MOCK_MODULES = [
     "torch.nn",
     "torch.nn.parallel",
     "torch.utils.data",
+    "torch.utils.data.distributed",
+    "wandb",
+    "zoopt",
 ]
+
+import scipy.stats
+import scipy.linalg
+
 for mod_name in MOCK_MODULES:
     sys.modules[mod_name] = mock.Mock()
 # ray.rllib.models.action_dist.py and
 # ray.rllib.models.lstm.py will use tf.VERSION
 sys.modules["tensorflow"].VERSION = "9.9.9"
+sys.modules["tensorflow.keras.callbacks"] = ChildClassMock()
+sys.modules["pytorch_lightning"] = ChildClassMock()
+sys.modules["xgboost"] = ChildClassMock()
+sys.modules["xgboost.core"] = ChildClassMock()
+sys.modules["xgboost.callback"] = ChildClassMock()
+
+
+class SimpleClass(object):
+    pass
+
+
+class SimpleClass2(object):
+    pass
+
+
+# ray.util.sgd.torch.lightning_operator.LightningOperator extends
+# TrainingOperator, pytorch_lightning.TrainerOptimizersMixin,
+# and pytorch_lightning.TrainerModelHooksMixin.
+# But, we are mocking all pytorch_lightning modules, causing the ptl base
+# classes to have a different metaclass than TrainingOperator.
+# To fix this, we replace the base classes with dummy classes that extend
+# object.
+# We have to create 2 dummy classes, one for TrainerOptimizersMixin and one
+# for TrainerModelHooksMixin so that we don't extend from the same base
+# class twice.
+setattr(sys.modules["pytorch_lightning.trainer.optimizers"],
+        "TrainerOptimizersMixin", SimpleClass)
+setattr(sys.modules["pytorch_lightning.trainer.model_hooks"],
+        "TrainerModelHooksMixin", SimpleClass2)
 
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 sys.path.insert(0, os.path.abspath("../../python/"))
+
+import ray
 
 # -- General configuration ------------------------------------------------
 
@@ -72,17 +139,37 @@ sys.path.insert(0, os.path.abspath("../../python/"))
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 extensions = [
-    'sphinx.ext.autodoc', 'sphinx.ext.viewcode', 'sphinx.ext.napoleon',
-    'sphinx_click.ext', 'sphinx-jsonschema', 'sphinx_gallery.gen_gallery'
+    'sphinx.ext.autodoc',
+    'sphinx.ext.viewcode',
+    'sphinx.ext.napoleon',
+    'sphinx_click.ext',
+    'sphinx_tabs.tabs',
+    'sphinx-jsonschema',
+    'sphinx_gallery.gen_gallery',
+    'sphinxemoji.sphinxemoji',
+    'sphinx_copybutton',
+    'versionwarning.extension',
 ]
 
+versionwarning_admonition_type = "tip"
+
+versionwarning_messages = {
+    "latest": (
+        "This document is for the latest pip release. "
+        'Visit the <a href="/en/master/">master branch documentation here</a>.'
+    ),
+}
+
+versionwarning_body_selector = "#main-content"
 sphinx_gallery_conf = {
-    "examples_dirs": ["../examples"],  # path to example scripts
-    "gallery_dirs": ["auto_examples"],  # path where to save generated examples
+    "examples_dirs": ["../examples",
+                      "tune/_tutorials"],  # path to example scripts
+    # path where to save generated examples
+    "gallery_dirs": ["auto_examples", "tune/tutorials"],
     "ignore_pattern": "../examples/doc_code/",
     "plot_gallery": "False",
     # "filename_pattern": "tutorial.py",
-    "backreferences_dir": False
+    # "backreferences_dir": "False",
     # "show_memory': False,
     # 'min_reported_time': False
 }
@@ -119,9 +206,9 @@ source_parsers = {
 master_doc = 'index'
 
 # General information about the project.
-project = u'Ray'
-copyright = u'2019, The Ray Team'
-author = u'The Ray Team'
+project = 'Ray'
+copyright = str(datetime.now().year) + ', The Ray Team'
+author = 'The Ray Team'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -149,7 +236,6 @@ language = None
 # directories to ignore when looking for source files.
 exclude_patterns = ['_build']
 exclude_patterns += sphinx_gallery_conf['examples_dirs']
-exclude_patterns += ["*/README.rst"]
 
 # The reST default role (used for this markup: `text`) to use for all
 # documents.
@@ -167,7 +253,7 @@ exclude_patterns += ["*/README.rst"]
 #show_authors = False
 
 # The name of the Pygments (syntax highlighting) style to use.
-pygments_style = 'sphinx'
+pygments_style = 'pastie'
 
 # A list of ignored prefixes for module index sorting.
 #modindex_common_prefix = []
@@ -182,33 +268,38 @@ todo_include_todos = False
 
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
-import sphinx_rtd_theme
-html_theme = 'sphinx_rtd_theme'
-html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
+html_theme = "sphinx_book_theme"
 
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
 # documentation.
-#html_theme_options = {}
+html_theme_options = {
+    "repository_url": "https://github.com/ray-project/ray",
+    "use_repository_button": True,
+    "use_issues_button": True,
+    "use_edit_page_button": True,
+    "path_to_docs": "doc/source",
+    "home_page_in_toc": True,
+}
 
 # Add any paths that contain custom themes here, relative to this directory.
 #html_theme_path = []
 
 # The name for this set of Sphinx documents.  If None, it defaults to
 # "<project> v<release> documentation".
-#html_title = None
+html_title = f"Ray v{release}"
 
 # A shorter title for the navigation bar.  Default is the same as html_title.
 #html_short_title = None
 
 # The name of an image file (relative to this directory) to place at the top
 # of the sidebar.
-#html_logo = None
+html_logo = "images/ray_logo.png"
 
 # The name of an image file (within the static path) to use as favicon of the
 # docs.  This file should be a Windows icon file (.ico) being 16x16 or 32x32
 # pixels large.
-#html_favicon = None
+html_favicon = "_static/favicon.ico"
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
@@ -229,7 +320,7 @@ html_static_path = ['_static']
 #html_use_smartypants = True
 
 # Custom sidebar templates, maps document names to template names.
-html_sidebars = {'**': ['index.html']}
+# html_sidebars = {'**': ['index.html']}
 
 # Additional templates that should be rendered to pages, maps page names to
 # template names.
@@ -386,5 +477,6 @@ def update_context(app, pagename, templatename, context, doctree):
 
 def setup(app):
     app.connect('html-page-context', update_context)
+    app.add_stylesheet('css/custom.css')
     # Custom directives
     app.add_directive('customgalleryitem', CustomGalleryItemDirective)

@@ -1,7 +1,3 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 from collections import OrderedDict
 
 from ray.rllib.env.constants import GROUP_REWARDS, GROUP_INFO
@@ -22,7 +18,7 @@ class _GroupAgentsWrapper(MultiAgentEnv):
 
         See MultiAgentEnv.with_agent_groups() for usage info.
 
-        Arguments:
+        Args:
             env (MultiAgentEnv): env to wrap
             groups (dict): Grouping spec as documented in MultiAgentEnv
             obs_space (Space): Optional observation space for the grouped

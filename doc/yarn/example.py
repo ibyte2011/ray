@@ -1,7 +1,3 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 from collections import Counter
 import sys
 import time
@@ -10,10 +6,10 @@ import ray
 
 @ray.remote
 def gethostname(x):
+    import platform
     import time
-    import socket
     time.sleep(0.01)
-    return x + (socket.gethostname(), )
+    return x + (platform.node(), )
 
 
 def wait_for_nodes(expected):

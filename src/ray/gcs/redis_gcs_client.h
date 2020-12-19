@@ -1,5 +1,18 @@
-#ifndef RAY_GCS_REDIS_GCS_CLIENT_H
-#define RAY_GCS_REDIS_GCS_CLIENT_H
+// Copyright 2017 The Ray Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//  http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
 
 #include <map>
 #include <string>
@@ -8,6 +21,7 @@
 #include "ray/common/status.h"
 #include "ray/gcs/asio.h"
 #include "ray/gcs/gcs_client.h"
+#include "ray/gcs/redis_client.h"
 #include "ray/gcs/tables.h"
 #include "ray/util/logging.h"
 
@@ -18,13 +32,6 @@ namespace gcs {
 class RedisContext;
 
 class RAY_EXPORT RedisGcsClient : public GcsClient {
-  // TODO(micafan) Will remove those friend class after we replace RedisGcsClient
-  // with interface class GcsClient in raylet.
-  friend class RedisActorInfoAccessor;
-  friend class RedisJobInfoAccessor;
-  friend class SubscriptionExecutorTest;
-  friend class LogSubscribeTestHelper;
-
  public:
   /// Constructor of RedisGcsClient.
   /// Connect() must be called(and return ok) before you call any other methods.
@@ -48,86 +55,77 @@ class RAY_EXPORT RedisGcsClient : public GcsClient {
   /// Must be single-threaded io_service (get more information from RedisAsioClient).
   ///
   /// \return Status
-  Status Connect(boost::asio::io_service &io_service);
+  Status Connect(boost::asio::io_service &io_service) override;
 
   /// Disconnect with GCS Service. Non-thread safe.
-  void Disconnect();
+  void Disconnect() override;
 
-  // TODO: Some API for getting the error on the driver
-  ObjectTable &object_table();
-  raylet::TaskTable &raylet_task_table();
-  TaskReconstructionLog &task_reconstruction_log();
-  TaskLeaseTable &task_lease_table();
-  ClientTable &client_table();
-  HeartbeatTable &heartbeat_table();
-  HeartbeatBatchTable &heartbeat_batch_table();
-  ErrorTable &error_table();
-  ProfileTable &profile_table();
-  ActorCheckpointTable &actor_checkpoint_table();
-  ActorCheckpointIdTable &actor_checkpoint_id_table();
-  DynamicResourceTable &resource_table();
-  /// Used only for direct calls. Tasks submitted through the raylet transport
-  /// should use Actors(), which has a requirement on the order in which
-  /// entries can be appended to the log.
-  DirectActorTable &direct_actor_table();
+  /// Returns debug string for class.
+  ///
+  /// \return string.
+  std::string DebugString() const override;
 
   // We also need something to export generic code to run on workers from the
   // driver (to set the PYTHONPATH)
-
   using GetExportCallback = std::function<void(const std::string &data)>;
   Status AddExport(const std::string &job_id, std::string &export_data);
   Status GetExport(const std::string &job_id, int64_t export_index,
                    const GetExportCallback &done_callback);
 
-  std::vector<std::shared_ptr<RedisContext>> shard_contexts() { return shard_contexts_; }
-  std::shared_ptr<RedisContext> primary_context() { return primary_context_; }
+  std::vector<std::shared_ptr<RedisContext>> shard_contexts() {
+    return redis_client_->GetShardContexts();
+  }
 
-  /// Returns debug string for class.
-  ///
-  /// \return string.
-  std::string DebugString() const;
+  std::shared_ptr<RedisContext> primary_context() {
+    return redis_client_->GetPrimaryContext();
+  }
+
+  std::shared_ptr<RedisClient> GetRedisClient() const { return redis_client_; }
+
+  /// The following xxx_table methods implement the Accessor interfaces.
+  /// Implements the Actors() interface.
+  LogBasedActorTable &log_based_actor_table();
+  ActorTable &actor_table();
+  /// Implements the Jobs() interface.
+  JobTable &job_table();
+  /// Implements the Objects() interface.
+  ObjectTable &object_table();
+  /// Implements the Nodes() interface.
+  NodeTable &node_table();
+  HeartbeatTable &heartbeat_table();
+  ResourceUsageBatchTable &resource_usage_batch_table();
+  DynamicResourceTable &resource_table();
+  /// Implements the Tasks() interface.
+  virtual raylet::TaskTable &raylet_task_table();
+  TaskLeaseTable &task_lease_table();
+  TaskReconstructionLog &task_reconstruction_log();
+  /// Implements the Stats() interface.
+  ProfileTable &profile_table();
+  /// Implements the Workers() interface.
+  WorkerTable &worker_table();
 
  private:
-  /// Attach this client to an asio event loop. Note that only
-  /// one event loop should be attached at a time.
-  void Attach(boost::asio::io_service &io_service);
-
-  /// This method will be deprecated, use method Actors() instead.
-  ActorTable &actor_table();
-  /// This method will be deprecated, use method Jobs() instead.
-  JobTable &job_table();
-
   // GCS command type. If CommandType::kChain, chain-replicated versions of the tables
   // might be used, if available.
   CommandType command_type_{CommandType::kUnknown};
 
+  std::shared_ptr<RedisClient> redis_client_;
+
   std::unique_ptr<ObjectTable> object_table_;
   std::unique_ptr<raylet::TaskTable> raylet_task_table_;
+  std::unique_ptr<LogBasedActorTable> log_based_actor_table_;
   std::unique_ptr<ActorTable> actor_table_;
-  std::unique_ptr<DirectActorTable> direct_actor_table_;
   std::unique_ptr<TaskReconstructionLog> task_reconstruction_log_;
   std::unique_ptr<TaskLeaseTable> task_lease_table_;
   std::unique_ptr<HeartbeatTable> heartbeat_table_;
-  std::unique_ptr<HeartbeatBatchTable> heartbeat_batch_table_;
-  std::unique_ptr<ErrorTable> error_table_;
+  std::unique_ptr<ResourceUsageBatchTable> resource_usage_batch_table_;
   std::unique_ptr<ProfileTable> profile_table_;
-  std::unique_ptr<ClientTable> client_table_;
-  std::unique_ptr<ActorCheckpointTable> actor_checkpoint_table_;
-  std::unique_ptr<ActorCheckpointIdTable> actor_checkpoint_id_table_;
+  std::unique_ptr<NodeTable> node_table_;
   std::unique_ptr<DynamicResourceTable> resource_table_;
-  // The following contexts write to the data shard
-  std::vector<std::shared_ptr<RedisContext>> shard_contexts_;
-  std::vector<std::unique_ptr<RedisAsioClient>> shard_asio_async_clients_;
-  std::vector<std::unique_ptr<RedisAsioClient>> shard_asio_subscribe_clients_;
-  // The following context writes everything to the primary shard
-  std::shared_ptr<RedisContext> primary_context_;
+  std::unique_ptr<WorkerTable> worker_table_;
   std::unique_ptr<JobTable> job_table_;
-  std::unique_ptr<RedisAsioClient> asio_async_auxiliary_client_;
-  std::unique_ptr<RedisAsioClient> asio_subscribe_auxiliary_client_;
 };
 
 }  // namespace gcs
 
 }  // namespace ray
-
-#endif  // RAY_GCS_REDIS_GCS_CLIENT_H

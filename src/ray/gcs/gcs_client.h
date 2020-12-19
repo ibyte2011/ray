@@ -1,13 +1,26 @@
-#ifndef RAY_GCS_GCS_CLIENT_H
-#define RAY_GCS_GCS_CLIENT_H
+// Copyright 2017 The Ray Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//  http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
 
 #include <boost/asio.hpp>
 #include <memory>
 #include <string>
 #include <vector>
+
 #include "ray/common/status.h"
-#include "ray/gcs/actor_info_accessor.h"
-#include "ray/gcs/job_info_accessor.h"
+#include "ray/gcs/accessor.h"
 #include "ray/util/logging.h"
 
 namespace ray {
@@ -31,6 +44,8 @@ class GcsClientOptions {
         server_port_(port),
         password_(password),
         is_test_client_(is_test_client) {}
+
+  GcsClientOptions() {}
 
   // GCS server address
   std::string server_ip_;
@@ -61,6 +76,9 @@ class GcsClient : public std::enable_shared_from_this<GcsClient> {
   /// Disconnect with GCS Service. Non-thread safe.
   virtual void Disconnect() = 0;
 
+  /// Return client information for debug.
+  virtual std::string DebugString() const { return ""; }
+
   /// Get the sub-interface for accessing actor information in GCS.
   /// This function is thread safe.
   ActorInfoAccessor &Actors() {
@@ -73,6 +91,62 @@ class GcsClient : public std::enable_shared_from_this<GcsClient> {
   JobInfoAccessor &Jobs() {
     RAY_CHECK(job_accessor_ != nullptr);
     return *job_accessor_;
+  }
+
+  /// Get the sub-interface for accessing object information in GCS.
+  /// This function is thread safe.
+  ObjectInfoAccessor &Objects() {
+    RAY_CHECK(object_accessor_ != nullptr);
+    return *object_accessor_;
+  }
+
+  /// Get the sub-interface for accessing node information in GCS.
+  /// This function is thread safe.
+  NodeInfoAccessor &Nodes() {
+    RAY_CHECK(node_accessor_ != nullptr);
+    return *node_accessor_;
+  }
+
+  /// Get the sub-interface for accessing node resource information in GCS.
+  /// This function is thread safe.
+  NodeResourceInfoAccessor &NodeResources() {
+    RAY_CHECK(node_resource_accessor_ != nullptr);
+    return *node_resource_accessor_;
+  }
+
+  /// Get the sub-interface for accessing task information in GCS.
+  /// This function is thread safe.
+  TaskInfoAccessor &Tasks() {
+    RAY_CHECK(task_accessor_ != nullptr);
+    return *task_accessor_;
+  }
+
+  /// Get the sub-interface for accessing error information in GCS.
+  /// This function is thread safe.
+  ErrorInfoAccessor &Errors() {
+    RAY_CHECK(error_accessor_ != nullptr);
+    return *error_accessor_;
+  }
+
+  /// Get the sub-interface for accessing stats information in GCS.
+  /// This function is thread safe.
+  StatsInfoAccessor &Stats() {
+    RAY_CHECK(stats_accessor_ != nullptr);
+    return *stats_accessor_;
+  }
+
+  /// Get the sub-interface for accessing worker information in GCS.
+  /// This function is thread safe.
+  WorkerInfoAccessor &Workers() {
+    RAY_CHECK(worker_accessor_ != nullptr);
+    return *worker_accessor_;
+  }
+
+  /// Get the sub-interface for accessing worker information in GCS.
+  /// This function is thread safe.
+  PlacementGroupInfoAccessor &PlacementGroups() {
+    RAY_CHECK(placement_group_accessor_ != nullptr);
+    return *placement_group_accessor_;
   }
 
  protected:
@@ -88,10 +162,16 @@ class GcsClient : public std::enable_shared_from_this<GcsClient> {
 
   std::unique_ptr<ActorInfoAccessor> actor_accessor_;
   std::unique_ptr<JobInfoAccessor> job_accessor_;
+  std::unique_ptr<ObjectInfoAccessor> object_accessor_;
+  std::unique_ptr<NodeInfoAccessor> node_accessor_;
+  std::unique_ptr<NodeResourceInfoAccessor> node_resource_accessor_;
+  std::unique_ptr<TaskInfoAccessor> task_accessor_;
+  std::unique_ptr<ErrorInfoAccessor> error_accessor_;
+  std::unique_ptr<StatsInfoAccessor> stats_accessor_;
+  std::unique_ptr<WorkerInfoAccessor> worker_accessor_;
+  std::unique_ptr<PlacementGroupInfoAccessor> placement_group_accessor_;
 };
 
 }  // namespace gcs
 
 }  // namespace ray
-
-#endif  // RAY_GCS_GCS_CLIENT_H

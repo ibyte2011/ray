@@ -1,3 +1,17 @@
+// Copyright 2017 The Ray Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//  http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -18,19 +32,16 @@
 // Adapted from https://github.com/ryangraham/hiredis-boostasio-adapter
 // (Copyright 2018 Ryan Graham)
 
-#ifndef RAY_GCS_ASIO_H
-#define RAY_GCS_ASIO_H
+#pragma once
 
 #include <stdio.h>
-#include <iostream>
-#include <string>
 
 #include <boost/asio.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/bind.hpp>
+#include <iostream>
+#include <string>
 
-#include "hiredis/async.h"
-#include "hiredis/hiredis.h"
 #include "ray/gcs/redis_async_context.h"
 
 class RedisAsioClient {
@@ -47,12 +58,9 @@ class RedisAsioClient {
 
   void operate();
 
-  void handle_read(boost::system::error_code ec);
-  void handle_write(boost::system::error_code ec);
-  void add_read();
-  void del_read();
-  void add_write();
-  void del_write();
+  void handle_io(boost::system::error_code ec, bool write);
+  void add_io(bool write);
+  void del_io(bool write);
   void cleanup();
 
  private:
@@ -78,5 +86,3 @@ extern "C" void call_C_delRead(void *private_data);
 extern "C" void call_C_addWrite(void *private_data);
 extern "C" void call_C_delWrite(void *private_data);
 extern "C" void call_C_cleanup(void *private_data);
-
-#endif  // RAY_GCS_ASIO_H
