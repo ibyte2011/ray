@@ -1,31 +1,163 @@
+# syntax=docker/dockerfile:1.3-labs
+
 # The base-deps Docker image installs main libraries needed to run Ray
 
-FROM ubuntu:xenial
-RUN apt-get update \
-    && apt-get install -y \
-        git \
-        wget \
-        cmake \
-        build-essential \
-        curl \
-        unzip \
-    && apt-get clean \
-    && echo 'export PATH=/opt/conda/bin:$PATH' > /etc/profile.d/conda.sh \
-    && wget \
-        --quiet 'https://repo.continuum.io/archive/Anaconda3-5.2.0-Linux-x86_64.sh' \
-        -O /tmp/anaconda.sh \
-    && /bin/bash /tmp/anaconda.sh -b -p /opt/conda \
-    && rm /tmp/anaconda.sh \
-    && /opt/conda/bin/conda install -y \
-        libgcc \
-    && /opt/conda/bin/conda clean -y --all \
-    && /opt/conda/bin/pip install \
-        flatbuffers \
-        cython==0.29.0 \
-        numpy==1.15.4
+# The GPU options are NVIDIA CUDA developer images.
+ARG BASE_IMAGE="ubuntu:22.04"
 
-# To avoid the following error on Jenkins:
-# AttributeError: 'numpy.ufunc' object has no attribute '__module__'
-RUN /opt/conda/bin/pip uninstall -y dask
+FROM ${BASE_IMAGE}
+# If this arg is not "autoscaler" then no autoscaler requirements will be included
+ENV TZ=America/Los_Angeles
+ENV LC_ALL=C.UTF-8
+ENV LANG=C.UTF-8
 
-ENV PATH "/opt/conda/bin:$PATH"
+# TODO(ilr) $HOME seems to point to result in "" instead of "/home/ray"
+# Q: Why add paths like /usr/local/nvidia/lib64 and /usr/local/nvidia/bin?
+# A: The NVIDIA GPU operator version used by GKE injects these into the container
+# after it's mounted to a pod.
+# Issue is tracked here:
+# https://github.com/GoogleCloudPlatform/compute-gpu-installation/issues/46
+# More context here:
+# https://github.com/NVIDIA/nvidia-container-toolkit/issues/275
+# and here:
+# https://gitlab.com/nvidia/container-images/cuda/-/issues/27
+ENV PATH "/home/ray/anaconda3/bin:$PATH:/usr/local/nvidia/bin"
+ENV LD_LIBRARY_PATH "$LD_LIBRARY_PATH:/usr/local/nvidia/lib64"
+ARG DEBIAN_FRONTEND=noninteractive
+ARG PYTHON_VERSION=3.10
+ARG CONSTRAINTS_FILE="python/requirements_compiled_py${PYTHON_VERSION}.txt"
+ARG PYTHON_DEPSET="python/deplocks/base_deps/ray_base_deps_py${PYTHON_VERSION}.lock"
+
+ARG RAY_UID=1000
+ARG RAY_GID=100
+
+RUN <<EOF
+#!/bin/bash
+
+set -euo pipefail
+
+apt-get update -y
+apt-get upgrade -y
+
+APT_PKGS=(
+    sudo
+    tzdata
+    git
+    libjemalloc-dev
+    wget
+    cmake
+    g++
+    zlib1g-dev
+
+    # For autoscaler
+    tmux
+    screen
+    rsync
+    netbase
+    openssh-client
+    gnupg
+)
+
+apt-get install -y "${APT_PKGS[@]}"
+
+useradd -ms /bin/bash -d /home/ray ray --uid $RAY_UID --gid $RAY_GID
+usermod -aG sudo ray
+echo 'ray ALL=NOPASSWD: ALL' >> /etc/sudoers
+
+EOF
+
+USER $RAY_UID
+ENV HOME=/home/ray
+WORKDIR /home/ray
+
+COPY --chown=ray "$CONSTRAINTS_FILE" /home/ray/requirements_compiled.txt
+COPY --chown=ray "$PYTHON_DEPSET" /home/ray/python_depset.lock
+
+SHELL ["/bin/bash", "-c"]
+
+RUN <<EOF
+#!/bin/bash
+
+set -euo pipefail
+
+# Determine the architecture of the host
+if [[ "${HOSTTYPE}" =~ ^x86_64 ]]; then
+    ARCH="x86_64"
+elif [[ "${HOSTTYPE}" =~ ^aarch64 ]]; then
+    ARCH="aarch64"
+else
+    echo "Unsupported architecture ${HOSTTYPE}" >/dev/stderr
+    exit 1
+fi
+
+# Install miniforge
+wget --quiet \
+    "https://github.com/conda-forge/miniforge/releases/download/24.11.3-0/Miniforge3-24.11.3-0-Linux-${ARCH}.sh" \
+    -O /tmp/miniforge.sh
+
+/bin/bash /tmp/miniforge.sh -b -u -p $HOME/anaconda3
+
+$HOME/anaconda3/bin/conda init
+echo 'export PATH=$HOME/anaconda3/bin:$PATH' >> $HOME/.bashrc
+rm /tmp/miniforge.sh
+# libffi needs a floor (>=3.4.6), not an exact pin, and must be solved
+# together with python: an exact pin in a separate step re-solves the env and
+# downgrades python to whatever patch release tolerates that libffi — on 3.14
+# that's 3.14.0, which fatally crashes Ray async actors running on fiber
+# stacks (python/cpython#141944, fixed upstream in 3.14.2).
+#
+# Pin certifi and pip to their eMudhra CA fix releases. certifi matches the pin
+# in the lock files, so the lock install below leaves conda's copy in place.
+# conda-forge certifi 2026.10.19 allows python 3.10 only through a repodata
+# patch (conda-forge/conda-forge-repodata-patches-feedstock@d7dcb640); its other
+# 2026 builds require python>=3.11, and without a 3.10 build the solver drops
+# certifi, requests and conda itself and fails with RemoveError.
+# TODO(elliot-barn): remove this conditional once Python 3.10 is deprecated.
+CONDA_PIP_SPEC=("pip=26.2.2")
+if [[ "${PYTHON_VERSION}" == "3.10" ]]; then
+    # conda-forge pip 26.2.2 requires python>=3.11; 3.10 installs it from PyPI below.
+    CONDA_PIP_SPEC=()
+fi
+# CVE-2026-111497: brotli-python < 1.2.1 is vulnerable. conda-forge has no py3.10
+# build of 1.2.1, so 3.10 installs the PyPI wheel below.
+CONDA_BROTLI_SPEC=("brotli-python>=1.2.1")
+if [[ "${PYTHON_VERSION}" == "3.10" ]]; then
+    CONDA_BROTLI_SPEC=()
+fi
+$HOME/anaconda3/bin/conda install -y libgcc-ng python=$PYTHON_VERSION "libffi>=3.4.6" "certifi=2026.10.19" "${CONDA_PIP_SPEC[@]}" "${CONDA_BROTLI_SPEC[@]}"
+$HOME/anaconda3/bin/conda clean -y --all
+
+# Install uv
+wget -qO- https://astral.sh/uv/0.13.4/install.sh | sudo -E env UV_UNMANAGED_INSTALL="/usr/local/bin" sh
+
+# Set up Conda as system Python
+export PATH=$HOME/anaconda3/bin:$PATH
+
+# conda-forge pip 26.2.2 requires python>=3.11; PyPI's supports 3.10.
+if [[ "${PYTHON_VERSION}" == "3.10" ]]; then
+    uv pip install --system --no-cache-dir pip==26.2.2
+    $HOME/anaconda3/bin/conda remove --force -y brotli-python
+    uv pip install --system --no-cache-dir --no-deps "Brotli==1.2.1"
+    $HOME/anaconda3/bin/conda clean -y --all
+fi
+
+# Some packages are on PyPI as well as other indices, but the latter
+# (unhelpfully) take precedence. We use `--index-strategy unsafe-best-match`
+# to ensure that the best match is chosen from the available indices.
+uv pip install --system --no-cache-dir --no-deps --index-strategy unsafe-best-match \
+    -r $HOME/python_depset.lock
+
+# We install cmake temporarily to get psutil
+sudo apt-get autoremove -y cmake zlib1g-dev
+
+# We keep g++ on GPU images, because uninstalling removes CUDA Devel tooling
+if [[ ! -d /usr/local/cuda ]]; then
+    sudo apt-get autoremove -y g++
+fi
+
+sudo rm -rf /var/lib/apt/lists/*
+sudo apt-get clean
+
+EOF
+
+WORKDIR $HOME

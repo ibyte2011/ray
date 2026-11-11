@@ -1,0 +1,62 @@
+import pytest
+
+import ray
+from ray.data.llm import build_processor, vLLMEngineProcessorConfig
+
+
+@pytest.fixture(autouse=True)
+def cleanup_ray_resources():
+    """Automatically cleanup Ray resources between tests to prevent conflicts."""
+    yield
+    ray.shutdown()
+
+
+@pytest.mark.parametrize(
+    "tp_size,pp_size",
+    [
+        # Cluster: 2 nodes x 2 GPUs. TPxPP=4 forces cross-node placement.
+        (1, 4),
+        (2, 2),
+    ],
+)
+@pytest.mark.requires_2x_2GPU
+def test_vllm_multi_node(tp_size, pp_size):
+    config = vLLMEngineProcessorConfig(
+        model_source="Qwen/Qwen3.5-0.8B",
+        engine_kwargs=dict(
+            enable_prefix_caching=True,
+            enable_chunked_prefill=True,
+            max_num_batched_tokens=4096,
+            pipeline_parallel_size=pp_size,
+            tensor_parallel_size=tp_size,
+            distributed_executor_backend="ray",
+        ),
+        tokenize_stage=False,
+        detokenize_stage=False,
+        concurrency=1,
+        batch_size=64,
+        chat_template_stage=False,
+    )
+
+    processor = build_processor(
+        config,
+        preprocess=lambda row: dict(
+            prompt=f"You are a calculator. {row['id']} ** 3 = ?",
+            sampling_params=dict(
+                temperature=0.3,
+                max_tokens=20,
+                detokenize=True,
+            ),
+        ),
+        postprocess=lambda row: dict(
+            resp=row["generated_text"],
+        ),
+    )
+
+    ds = ray.data.range(60)
+    ds = processor(ds)
+    ds = ds.materialize()
+
+    outs = ds.take_all()
+    assert len(outs) == 60
+    assert all("resp" in out for out in outs)

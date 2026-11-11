@@ -1,84 +1,150 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import collections
 import logging
+from typing import TYPE_CHECKING, Dict, List, Optional
+
 import numpy as np
 
-from ray.tune.trial import Trial
+from ray.tune.experiment import Trial
+from ray.tune.result import DEFAULT_METRIC
 from ray.tune.schedulers.trial_scheduler import FIFOScheduler, TrialScheduler
+from ray.util.annotations import PublicAPI
+
+if TYPE_CHECKING:
+    from ray.tune.execution.tune_controller import TuneController
 
 logger = logging.getLogger(__name__)
 
 
+@PublicAPI
 class MedianStoppingRule(FIFOScheduler):
     """Implements the median stopping rule as described in the Vizier paper:
 
     https://research.google.com/pubs/pub46180.html
 
     Args:
-        time_attr (str): The training result attr to use for comparing time.
+        time_attr: The training result attr to use for comparing time.
             Note that you can pass in something non-temporal such as
             `training_iteration` as a measure of progress, the only requirement
             is that the attribute should increase monotonically.
-        metric (str): The training result objective value attribute. Stopping
-            procedures will use this attribute.
-        mode (str): One of {min, max}. Determines whether objective is
+            Valid values are any key reported in the result dict by your
+            trainable. The auto-filled keys ``"training_iteration"`` (the
+            iteration count) and ``"time_total_s"`` (wall-clock seconds since
+            the trial started) always work; any additional numeric, monotonic
+            key your trainable reports via ``tune.report({...})`` is also valid
+            (for example ``"timesteps_total"`` or a custom progress counter).
+            Passing a key that is not present in the reported result causes
+            the scheduler to skip its decision for that step.
+        metric: The training result objective value attribute. Stopping
+            procedures will use this attribute. If None but a mode was passed,
+            the `ray.tune.result.DEFAULT_METRIC` will be used per default.
+        mode: One of {min, max}. Determines whether objective is
             minimizing or maximizing the metric attribute.
-        grace_period (float): Only stop trials at least this old in time.
+        grace_period: Only stop trials at least this old in time.
             The mean will only be computed from this time onwards. The units
             are the same as the attribute named by `time_attr`.
-        min_samples_required (int): Minimum number of trials to compute median
+        min_samples_required: Minimum number of trials to compute median
             over.
-        min_time_slice (float): Each trial runs at least this long before
+        min_time_slice: Each trial runs at least this long before
             yielding (assuming it isn't stopped). Note: trials ONLY yield if
             there are not enough samples to evaluate performance for the
             current result AND there are other trials waiting to run.
             The units are the same as the attribute named by `time_attr`.
-        hard_stop (bool): If False, pauses trials instead of stopping
+        hard_stop: If False, pauses trials instead of stopping
             them. When all other trials are complete, paused trials will be
             resumed and allowed to run FIFO.
     """
 
-    def __init__(self,
-                 time_attr="time_total_s",
-                 reward_attr=None,
-                 metric="episode_reward_mean",
-                 mode="max",
-                 grace_period=60.0,
-                 min_samples_required=3,
-                 min_time_slice=0,
-                 hard_stop=True):
-        assert mode in ["min", "max"], "`mode` must be 'min' or 'max'!"
-        if reward_attr is not None:
-            mode = "max"
-            metric = reward_attr
-            logger.warning(
-                "`reward_attr` is deprecated and will be removed in a future "
-                "version of Tune. "
-                "Setting `metric={}` and `mode=max`.".format(reward_attr))
-        FIFOScheduler.__init__(self)
+    def __init__(
+        self,
+        time_attr: str = "time_total_s",
+        metric: Optional[str] = None,
+        mode: Optional[str] = None,
+        grace_period: float = 60.0,
+        min_samples_required: int = 3,
+        min_time_slice: int = 0,
+        hard_stop: bool = True,
+    ):
+        super().__init__()
         self._stopped_trials = set()
         self._grace_period = grace_period
         self._min_samples_required = min_samples_required
         self._min_time_slice = min_time_slice
         self._metric = metric
-        assert mode in {"min", "max"}, "`mode` must be 'min' or 'max'."
-        self._worst = float("-inf") if mode == "max" else float("inf")
-        self._compare_op = max if mode == "max" else min
+        self._worst = None
+        self._compare_op = None
+
+        self._mode = mode
+        if mode:
+            assert mode in ["min", "max"], "`mode` must be 'min' or 'max'."
+            self._worst = float("-inf") if self._mode == "max" else float("inf")
+            self._compare_op = max if self._mode == "max" else min
+
         self._time_attr = time_attr
         self._hard_stop = hard_stop
         self._trial_state = {}
         self._last_pause = collections.defaultdict(lambda: float("-inf"))
         self._results = collections.defaultdict(list)
 
-    def on_trial_result(self, trial_runner, trial, result):
+    def set_search_properties(
+        self, metric: Optional[str], mode: Optional[str], **spec
+    ) -> bool:
+        if self._metric and metric:
+            return False
+        if self._mode and mode:
+            return False
+
+        if metric:
+            self._metric = metric
+        if mode:
+            self._mode = mode
+
+        self._worst = float("-inf") if self._mode == "max" else float("inf")
+        self._compare_op = max if self._mode == "max" else min
+
+        if self._metric is None and self._mode:
+            # If only a mode was passed, use anonymous metric
+            self._metric = DEFAULT_METRIC
+
+        return True
+
+    def on_trial_add(self, tune_controller: "TuneController", trial: Trial):
+        if not self._metric or not self._worst or not self._compare_op:
+            raise ValueError(
+                "{} has been instantiated without a valid `metric` ({}) or "
+                "`mode` ({}) parameter. Either pass these parameters when "
+                "instantiating the scheduler, or pass them as parameters "
+                "to `tune.TuneConfig()`".format(
+                    self.__class__.__name__, self._metric, self._mode
+                )
+            )
+
+        super(MedianStoppingRule, self).on_trial_add(tune_controller, trial)
+
+    def on_trial_result(
+        self, tune_controller: "TuneController", trial: Trial, result: Dict
+    ) -> str:
         """Callback for early stopping.
 
-        This stopping rule stops a running trial if the trial's best objective
-        value by step `t` is strictly worse than the median of the running
-        averages of all completed trials' objectives reported up to step `t`.
+        Let ``t`` be this result's value of ``time_attr``. Once ``t`` reaches
+        ``grace_period``, the rule compares the trial against every other trial
+        that has already reported a result at ``t`` or later, whether it's still
+        running or finished. For each of those trials, it averages the metric
+        over the results reported between ``grace_period`` and ``t``. If the
+        trial's best metric value so far is strictly worse than the median of
+        those averages, the rule stops the trial.
+
+        Args:
+            tune_controller: The controller running the experiment.
+            trial: The trial that reported the result.
+            result: The result the trial reported.
+
+        Returns:
+            ``TrialScheduler.STOP`` to stop the trial early, or
+            ``TrialScheduler.PAUSE`` instead when ``hard_stop`` is False.
+            When too few other trials have reached ``t`` to compare against,
+            ``TrialScheduler.PAUSE`` if more than ``min_time_slice`` has passed
+            since the trial last paused and other trials are waiting to run.
+            Otherwise ``TrialScheduler.CONTINUE``.
         """
         if self._time_attr not in result or self._metric not in result:
             return TrialScheduler.CONTINUE
@@ -97,8 +163,15 @@ class MedianStoppingRule(FIFOScheduler):
         trials = self._trials_beyond_time(time)
         trials.remove(trial)
 
-        if len(trials) < self._min_samples_required:
-            action = self._on_insufficient_samples(trial_runner, trial, time)
+        # Exclude `np.nan` and `np.inf` values.
+        running_means = [
+            running_mean
+            for running_mean in (self._running_mean(other, time) for other in trials)
+            if np.isfinite(running_mean)
+        ]
+
+        if len(running_means) < self._min_samples_required:
+            action = self._on_insufficient_samples(tune_controller, trial, time)
             if action == TrialScheduler.PAUSE:
                 self._last_pause[trial] = time
                 action_str = "Yielding time to other trials."
@@ -107,13 +180,18 @@ class MedianStoppingRule(FIFOScheduler):
             logger.debug(
                 "MedianStoppingRule: insufficient samples={} to evaluate "
                 "trial {} at t={}. {}".format(
-                    len(trials), trial.trial_id, time, action_str))
+                    len(running_means), trial.trial_id, time, action_str
+                )
+            )
             return action
 
-        median_result = self._median_result(trials, time)
+        median_result = np.median(running_means)
         best_result = self._best_result(trial)
-        logger.debug("Trial {} best res={} vs median res={} at t={}".format(
-            trial, best_result, median_result, time))
+        logger.debug(
+            "Trial {} best res={} vs median res={} at t={}".format(
+                trial, best_result, median_result, time
+            )
+        )
 
         if self._compare_op(median_result, best_result) != best_result:
             logger.debug("MedianStoppingRule: early stopping {}".format(trial))
@@ -125,39 +203,45 @@ class MedianStoppingRule(FIFOScheduler):
         else:
             return TrialScheduler.CONTINUE
 
-    def on_trial_complete(self, trial_runner, trial, result):
+    def on_trial_complete(
+        self, tune_controller: "TuneController", trial: Trial, result: Dict
+    ):
         self._results[trial].append(result)
 
-    def debug_string(self):
+    def debug_string(self) -> str:
         return "Using MedianStoppingRule: num_stopped={}.".format(
-            len(self._stopped_trials))
+            len(self._stopped_trials)
+        )
 
-    def _on_insufficient_samples(self, trial_runner, trial, time):
+    def _on_insufficient_samples(
+        self, tune_controller: "TuneController", trial: Trial, time: float
+    ) -> str:
         pause = time - self._last_pause[trial] > self._min_time_slice
         pause = pause and [
-            t for t in trial_runner.get_trials()
+            t
+            for t in tune_controller.get_live_trials()
             if t.status in (Trial.PENDING, Trial.PAUSED)
         ]
         return TrialScheduler.PAUSE if pause else TrialScheduler.CONTINUE
 
-    def _trials_beyond_time(self, time):
+    def _trials_beyond_time(self, time: float) -> List[Trial]:
         trials = [
-            trial for trial in self._results
+            trial
+            for trial in self._results
             if self._results[trial][-1][self._time_attr] >= time
         ]
         return trials
 
-    def _median_result(self, trials, time):
-        return np.median([self._running_mean(trial, time) for trial in trials])
-
-    def _running_mean(self, trial, time):
+    def _running_mean(self, trial: Trial, time: float) -> np.ndarray:
         results = self._results[trial]
         # TODO(ekl) we could do interpolation to be more precise, but for now
         # assume len(results) is large and the time diffs are roughly equal
         scoped_results = [
-            r for r in results
-            if self._grace_period <= r[self._time_attr] <= time
+            r for r in results if self._grace_period <= r[self._time_attr] <= time
         ]
+        if not scoped_results:
+            # Sparse reporting can skip the window entirely; `np.mean([])` is nan plus a warning.
+            return np.nan
         return np.mean([r[self._metric] for r in scoped_results])
 
     def _best_result(self, trial):

@@ -1,69 +1,48 @@
-import { Theme } from "@material-ui/core/styles/createMuiTheme";
-import createStyles from "@material-ui/core/styles/createStyles";
-import withStyles, { WithStyles } from "@material-ui/core/styles/withStyles";
-import Table from "@material-ui/core/Table";
-import TableBody from "@material-ui/core/TableBody";
-import TableCell from "@material-ui/core/TableCell";
-import TableRow from "@material-ui/core/TableRow";
-import classNames from "classnames";
+import { styled, Table, TableBody, TableCell, TableRow } from "@mui/material";
 import React from "react";
 
-const styles = (theme: Theme) =>
-  createStyles({
-    root: {
-      overflowX: "auto"
-    },
-    cell: {
-      borderWidth: 0,
-      fontFamily: "SFMono-Regular,Consolas,Liberation Mono,Menlo,monospace",
-      padding: 0,
-      "&:last-child": {
-        paddingRight: 0
-      }
-    },
-    lineNumber: {
-      color: theme.palette.text.secondary,
-      paddingRight: theme.spacing(2),
-      textAlign: "right",
-      verticalAlign: "top",
-      width: "1%",
-      // Use a ::before pseudo-element for the line number so that it won't
-      // interact with user selections or searching.
-      "&::before": {
-        content: "attr(data-line-number)"
-      }
-    },
-    line: {
-      textAlign: "left",
-      whiteSpace: "pre-wrap"
-    }
-  });
+const StyledTableCell = styled(TableCell)(() => ({
+  borderWidth: 0,
+  fontFamily: "SFMono-Regular,Consolas,Liberation Mono,Menlo,monospace",
+  padding: 0,
+  "&:last-child": {
+    paddingRight: 0,
+  },
+}));
 
-interface Props {
+type NumberedLinesProps = {
   lines: string[];
-}
+};
 
-class NumberedLines extends React.Component<Props & WithStyles<typeof styles>> {
-  render() {
-    const { classes, lines } = this.props;
-    return (
-      <Table>
-        <TableBody>
-          {lines.map((line, index) => (
-            <TableRow key={index}>
-              <TableCell
-                className={classNames(classes.cell, classes.lineNumber)}
-                data-line-number={index + 1}
-              />
-              <TableCell className={classNames(classes.cell, classes.line)}>
-                {line}
-              </TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    );
-  }
-}
+const NumberedLines = ({ lines }: NumberedLinesProps) => {
+  return (
+    <Table>
+      <TableBody>
+        {lines.map((line, index) => (
+          <TableRow key={index}>
+            <StyledTableCell
+              sx={(theme) => ({
+                color: theme.palette.text.secondary,
+                paddingRight: 2,
+                textAlign: "right",
+                verticalAlign: "top",
+                width: "1%",
+                // Use a ::before pseudo-element for the line number so that it won't
+                // interact with user selections or searching.
+                "&::before": {
+                  content: "attr(data-line-number)",
+                },
+              })}
+              data-line-number={index + 1}
+            />
+            <StyledTableCell sx={{ textAlign: "left", whiteSpace: "pre-wrap" }}>
+              {line}
+            </StyledTableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+};
 
-export default withStyles(styles)(NumberedLines);
+export default NumberedLines;

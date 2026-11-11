@@ -1,10 +1,8 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import pytest
+import sys
 import time
+
 import numpy as np
+import pytest
 
 import ray
 
@@ -62,8 +60,7 @@ def test_timing(ray_start_regular):
         elapsed_times.append(end_time - start_time)
     elapsed_times = np.sort(elapsed_times)
     average_elapsed_time = sum(elapsed_times) / 1000
-    print("Time required to submit a trivial function call and get the "
-          "result:")
+    print("Time required to submit a trivial function call and get the result:")
     print("    Average: {}".format(average_elapsed_time))
     print("    90th percentile: {}".format(elapsed_times[900]))
     print("    99th percentile: {}".format(elapsed_times[990]))
@@ -103,11 +100,8 @@ def test_cache(ray_start_regular):
     d = time.time() - c
 
     if d > 1.5 * b:
-        print("WARNING: The caching test was too slow. "
-              "d = {}, b = {}".format(d, b))
+        print("WARNING: The caching test was too slow. d = {}, b = {}".format(d, b))
 
 
 if __name__ == "__main__":
-    import pytest
-    import sys
-    sys.exit(pytest.main(["-v", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

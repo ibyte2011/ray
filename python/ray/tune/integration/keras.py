@@ -1,50 +1,72 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+from typing import Dict
 
-from tensorflow import keras
-from ray.tune import track
+import ray.tune
+from ray.train.tensorflow import TensorflowCheckpoint
+from ray.train.tensorflow.keras import RayReportCallback
+from ray.util.annotations import PublicAPI
+
+_DEPRECATION_MESSAGE = (
+    "The `ray.tune.integration.keras` module is deprecated in favor of "
+    "`ray.train.tensorflow.keras.ReportCheckpointCallback`."
+)
 
 
-class TuneReporterCallback(keras.callbacks.Callback):
-    """Tune Callback for Keras."""
+class TuneReportCallback:
+    """Deprecated.
+    Use :class:`ray.train.tensorflow.keras.ReportCheckpointCallback` instead."""
 
-    def __init__(self, reporter=None, freq="batch", logs={}):
-        """Initializer.
+    def __new__(cls, *args, **kwargs):
+        raise DeprecationWarning(_DEPRECATION_MESSAGE)
 
-        Args:
-            reporter (StatusReporter|tune.track.log|None): Tune object for
-                returning results.
-            freq (str): Sets the frequency of reporting intermediate results.
-                One of ["batch", "epoch"].
-        """
-        self.reporter = reporter or track.log
-        self.iteration = 0
-        if freq not in ["batch", "epoch"]:
-            raise ValueError("{} not supported as a frequency.".format(freq))
-        self.freq = freq
-        super(TuneReporterCallback, self).__init__()
 
-    def on_batch_end(self, batch, logs={}):
-        if not self.freq == "batch":
-            return
-        self.iteration += 1
-        for metric in list(logs):
-            if "loss" in metric and "neg_" not in metric:
-                logs["neg_" + metric] = -logs[metric]
-        if "acc" in logs:
-            self.reporter(keras_info=logs, mean_accuracy=logs["acc"])
-        else:
-            self.reporter(keras_info=logs, mean_accuracy=logs.get("accuracy"))
+class _TuneCheckpointCallback:
+    """Deprecated.
+    Use :class:`ray.train.tensorflow.keras.ReportCheckpointCallback` instead."""
 
-    def on_epoch_end(self, batch, logs={}):
-        if not self.freq == "epoch":
-            return
-        self.iteration += 1
-        for metric in list(logs):
-            if "loss" in metric and "neg_" not in metric:
-                logs["neg_" + metric] = -logs[metric]
-        if "acc" in logs:
-            self.reporter(keras_info=logs, mean_accuracy=logs["acc"])
-        else:
-            self.reporter(keras_info=logs, mean_accuracy=logs.get("accuracy"))
+    def __new__(cls, *args, **kwargs):
+        raise DeprecationWarning(_DEPRECATION_MESSAGE)
+
+
+@PublicAPI(stability="alpha")
+class TuneReportCheckpointCallback(RayReportCallback):
+    """Keras callback for Ray Tune reporting and checkpointing.
+
+    .. note::
+        Metrics are always reported with checkpoints, even if the event isn't specified
+        in ``report_metrics_on``.
+
+    Example:
+        .. code-block:: python
+
+            ############# Using it in Ray Tune ###############
+            from ray.tune.integrations.keras import TuneReportCheckpointCallback
+
+            def train_fn():
+                model = build_model()
+                model.fit(dataset_shard, callbacks=[TuneReportCheckpointCallback()])
+
+            tuner = tune.Tuner(train_fn)
+            results = tuner.fit()
+
+    Args:
+        metrics: Metrics to report. If this is a list, each item describes
+            the metric key reported to Keras, and it's reported under the
+            same name. If this is a dict, each key is the name reported
+            and the respective value is the metric key reported to Keras.
+            If this is None, all Keras logs are reported.
+        report_metrics_on: When to report metrics. Must be one of
+            the Keras event hooks (less the ``on_``), e.g.
+            "train_start" or "predict_end". Defaults to "epoch_end".
+        checkpoint_on: When to save checkpoints. Must be one of the Keras event hooks
+            (less the ``on_``), e.g. "train_start" or "predict_end". Defaults to
+            "epoch_end".
+
+    """
+
+    def _save_and_report_checkpoint(
+        self, metrics: Dict, checkpoint: TensorflowCheckpoint
+    ):
+        ray.tune.report(metrics, checkpoint=checkpoint)
+
+    def _report_metrics(self, metrics: Dict):
+        ray.tune.report(metrics)

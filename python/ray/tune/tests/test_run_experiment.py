@@ -1,144 +1,140 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
 import unittest
 
 import ray
-from ray.rllib import _register_all
-
-from ray.tune.result import TIMESTEPS_TOTAL
-from ray.tune import Trainable, TuneError
-from ray.tune import register_trainable, run_experiments
-from ray.tune.logger import Logger
+from ray.tune import (
+    CheckpointConfig,
+    Trainable,
+    TuneError,
+    register_trainable,
+    run_experiments,
+)
 from ray.tune.experiment import Experiment
-from ray.tune.trial import Trial, ExportFormat
+from ray.tune.experiment.trial import ExportFormat, Trial
+from ray.tune.logger import LoggerCallback
+from ray.tune.result import TIMESTEPS_TOTAL
+
+
+def train_fn(config):
+    for i in range(100):
+        ray.tune.report(dict(timesteps_total=i))
 
 
 class RunExperimentTest(unittest.TestCase):
+    def setUp(self):
+        os.environ["TUNE_STATE_REFRESH_PERIOD"] = "0.1"
+        register_trainable("f1", train_fn)
+
     def tearDown(self):
         ray.shutdown()
-        _register_all()  # re-register the evicted objects
 
     def testDict(self):
-        def train(config, reporter):
-            for i in range(100):
-                reporter(timesteps_total=i)
-
-        register_trainable("f1", train)
-        trials = run_experiments({
-            "foo": {
-                "run": "f1",
-            },
-            "bar": {
-                "run": "f1",
+        trials = run_experiments(
+            {
+                "foo": {
+                    "run": "f1",
+                },
+                "bar": {
+                    "run": "f1",
+                },
             }
-        })
+        )
         for trial in trials:
             self.assertEqual(trial.status, Trial.TERMINATED)
             self.assertEqual(trial.last_result[TIMESTEPS_TOTAL], 99)
 
     def testExperiment(self):
-        def train(config, reporter):
-            for i in range(100):
-                reporter(timesteps_total=i)
-
-        register_trainable("f1", train)
-        exp1 = Experiment(**{
-            "name": "foo",
-            "run": "f1",
-        })
+        exp1 = Experiment(
+            **{
+                "name": "foo",
+                "run": "f1",
+            }
+        )
         [trial] = run_experiments(exp1)
         self.assertEqual(trial.status, Trial.TERMINATED)
         self.assertEqual(trial.last_result[TIMESTEPS_TOTAL], 99)
 
     def testExperimentList(self):
-        def train(config, reporter):
-            for i in range(100):
-                reporter(timesteps_total=i)
-
-        register_trainable("f1", train)
-        exp1 = Experiment(**{
-            "name": "foo",
-            "run": "f1",
-        })
-        exp2 = Experiment(**{
-            "name": "bar",
-            "run": "f1",
-        })
+        exp1 = Experiment(
+            **{
+                "name": "foo",
+                "run": "f1",
+            }
+        )
+        exp2 = Experiment(
+            **{
+                "name": "bar",
+                "run": "f1",
+            }
+        )
         trials = run_experiments([exp1, exp2])
         for trial in trials:
             self.assertEqual(trial.status, Trial.TERMINATED)
             self.assertEqual(trial.last_result[TIMESTEPS_TOTAL], 99)
 
     def testAutoregisterTrainable(self):
-        def train(config, reporter):
-            for i in range(100):
-                reporter(timesteps_total=i)
-
         class B(Trainable):
-            def _train(self):
+            def step(self):
                 return {"timesteps_this_iter": 1, "done": True}
 
-        register_trainable("f1", train)
-        trials = run_experiments({
-            "foo": {
-                "run": train,
-            },
-            "bar": {
-                "run": B
+        trials = run_experiments(
+            {
+                "foo": {
+                    "run": train_fn,
+                },
+                "bar": {"run": B},
             }
-        })
+        )
         for trial in trials:
             self.assertEqual(trial.status, Trial.TERMINATED)
 
     def testCheckpointAtEnd(self):
-        class train(Trainable):
-            def _train(self):
+        class MyTrainable(Trainable):
+            def step(self):
                 return {"timesteps_this_iter": 1, "done": True}
 
-            def _save(self, path):
-                checkpoint = path + "/checkpoint"
+            def save_checkpoint(self, path):
+                checkpoint = os.path.join(path, "checkpoint")
                 with open(checkpoint, "w") as f:
                     f.write("OK")
-                return checkpoint
 
-        trials = run_experiments({
-            "foo": {
-                "run": train,
-                "checkpoint_at_end": True
+        trials = run_experiments(
+            {
+                "foo": {
+                    "run": MyTrainable,
+                    "checkpoint_config": CheckpointConfig(checkpoint_at_end=True),
+                }
             }
-        })
+        )
         for trial in trials:
             self.assertEqual(trial.status, Trial.TERMINATED)
-            self.assertTrue(trial.has_checkpoint())
+            self.assertTrue(trial.checkpoint)
 
     def testExportFormats(self):
-        class train(Trainable):
-            def _train(self):
+        class train_fn(Trainable):
+            def step(self):
                 return {"timesteps_this_iter": 1, "done": True}
 
             def _export_model(self, export_formats, export_dir):
-                path = export_dir + "/exported"
+                path = os.path.join(export_dir, "exported")
                 with open(path, "w") as f:
                     f.write("OK")
                 return {export_formats[0]: path}
 
-        trials = run_experiments({
-            "foo": {
-                "run": train,
-                "export_formats": ["format"]
-            }
-        })
+        trials = run_experiments(
+            {"foo": {"run": train_fn, "export_formats": ["format"]}}
+        )
         for trial in trials:
             self.assertEqual(trial.status, Trial.TERMINATED)
             self.assertTrue(
-                os.path.exists(os.path.join(trial.logdir, "exported")))
+                os.path.exists(
+                    os.path.join(trial.storage.trial_working_directory, "exported")
+                )
+            )
 
     def testInvalidExportFormats(self):
-        class train(Trainable):
-            def _train(self):
+        class MyTrainable(Trainable):
+            def step(self):
                 return {"timesteps_this_iter": 1, "done": True}
 
             def _export_model(self, export_formats, export_dir):
@@ -146,12 +142,7 @@ class RunExperimentTest(unittest.TestCase):
                 return {}
 
         def fail_trial():
-            run_experiments({
-                "foo": {
-                    "run": train,
-                    "export_formats": ["format"]
-                }
-            })
+            run_experiments({"foo": {"run": MyTrainable, "export_formats": ["format"]}})
 
         self.assertRaises(TuneError, fail_trial)
 
@@ -159,83 +150,89 @@ class RunExperimentTest(unittest.TestCase):
         ray.shutdown()
         ray.init(resources={"hi": 3})
 
-        class train(Trainable):
-            def _train(self):
+        class MyTrainable(Trainable):
+            def step(self):
                 return {"timesteps_this_iter": 1, "done": True}
 
-        trials = run_experiments({
-            "foo": {
-                "run": train,
-                "resources_per_trial": {
-                    "cpu": 1,
-                    "custom_resources": {
-                        "hi": 2
-                    }
+        trials = run_experiments(
+            {
+                "foo": {
+                    "run": MyTrainable,
+                    "resources_per_trial": {"cpu": 1, "custom_resources": {"hi": 2}},
                 }
             }
-        })
+        )
         for trial in trials:
             self.assertEqual(trial.status, Trial.TERMINATED)
 
-    def testCustomLogger(self):
-        class CustomLogger(Logger):
-            def on_result(self, result):
-                with open(os.path.join(self.logdir, "test.log"), "w") as f:
+    def testCustomLoggerNoAutoLogging(self):
+        """Does not create CSV/JSON logger callbacks automatically"""
+        os.environ["TUNE_DISABLE_AUTO_CALLBACK_LOGGERS"] = "1"
+
+        class CustomLoggerCallback(LoggerCallback):
+            def log_trial_result(self, iteration, trial, result):
+                with open(os.path.join(trial.local_path, "test.log"), "w") as f:
                     f.write("hi")
 
-        [trial] = run_experiments({
-            "foo": {
-                "run": "__fake",
-                "stop": {
-                    "training_iteration": 1
-                },
-                "loggers": [CustomLogger]
-            }
-        })
-        self.assertTrue(os.path.exists(os.path.join(trial.logdir, "test.log")))
-        self.assertFalse(
-            os.path.exists(os.path.join(trial.logdir, "params.json")))
+        [trial] = run_experiments(
+            {"foo": {"run": "f1", "stop": {"training_iteration": 1}}},
+            callbacks=[CustomLoggerCallback()],
+        )
+        self.assertTrue(os.path.exists(os.path.join(trial.local_path, "test.log")))
+        self.assertFalse(os.path.exists(os.path.join(trial.local_path, "params.json")))
 
-        [trial] = run_experiments({
-            "foo": {
-                "run": "__fake",
-                "stop": {
-                    "training_iteration": 1
-                }
-            }
-        })
-        self.assertTrue(
-            os.path.exists(os.path.join(trial.logdir, "params.json")))
+        [trial] = run_experiments(
+            {"foo": {"run": "f1", "stop": {"training_iteration": 1}}}
+        )
+        self.assertFalse(os.path.exists(os.path.join(trial.local_path, "params.json")))
 
-        [trial] = run_experiments({
-            "foo": {
-                "run": "__fake",
-                "stop": {
-                    "training_iteration": 1
-                },
-                "loggers": []
-            }
-        })
-        self.assertFalse(
-            os.path.exists(os.path.join(trial.logdir, "params.json")))
+        [trial] = run_experiments(
+            {"foo": {"run": "f1", "stop": {"training_iteration": 1}}},
+        )
+        self.assertFalse(os.path.exists(os.path.join(trial.local_path, "params.json")))
+
+    def testCustomLoggerWithAutoLogging(self):
+        """Creates CSV/JSON logger callbacks automatically"""
+        if "TUNE_DISABLE_AUTO_CALLBACK_LOGGERS" in os.environ:
+            del os.environ["TUNE_DISABLE_AUTO_CALLBACK_LOGGERS"]
+
+        class CustomLoggerCallback(LoggerCallback):
+            def log_trial_result(self, iteration, trial, result):
+                with open(os.path.join(trial.local_path, "test.log"), "w") as f:
+                    f.write("hi")
+
+        [trial] = run_experiments(
+            {"foo": {"run": "f1", "stop": {"training_iteration": 1}}},
+            callbacks=[CustomLoggerCallback()],
+        )
+        self.assertTrue(os.path.exists(os.path.join(trial.local_path, "test.log")))
+        self.assertTrue(os.path.exists(os.path.join(trial.local_path, "params.json")))
+
+        [trial] = run_experiments(
+            {"foo": {"run": "f1", "stop": {"training_iteration": 1}}}
+        )
+        self.assertTrue(os.path.exists(os.path.join(trial.local_path, "params.json")))
 
     def testCustomTrialString(self):
-        [trial] = run_experiments({
-            "foo": {
-                "run": "__fake",
-                "stop": {
-                    "training_iteration": 1
-                },
-                "trial_name_creator":
-                    lambda t: "{}_{}_321".format(t.trainable_name, t.trial_id)
+        [trial] = run_experiments(
+            {
+                "foo": {
+                    "run": "f1",
+                    "stop": {"training_iteration": 1},
+                    "trial_name_creator": lambda t: "{}_{}_321".format(
+                        t.trainable_name, t.trial_id
+                    ),
+                }
             }
-        })
-        self.assertEquals(
-            str(trial), "{}_{}_321".format(trial.trainable_name,
-                                           trial.trial_id))
+        )
+        self.assertEqual(
+            str(trial), "{}_{}_321".format(trial.trainable_name, trial.trial_id)
+        )
 
 
 if __name__ == "__main__":
-    import pytest
     import sys
+
+    import pytest
+
     sys.exit(pytest.main(["-v", __file__]))

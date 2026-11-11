@@ -1,238 +1,485 @@
 load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository", "new_git_repository")
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
 
-def github_repository(*, name=None, remote=None, commit=None, tag=None,
-                      branch=None, build_file=None, build_file_content=None,
-                      sha256=None, shallow_since=None, strip_prefix=True,
-                      url=None, path=None, **kwargs):
+def urlsplit(url):
+    """ Splits a URL like "https://example.com/a/b?c=d&e#f" into a tuple:
+        ("https", ["example", "com"], ["a", "b"], ["c=d", "e"], "f")
+    A trailing slash will result in a correspondingly empty final path component.
     """
-    Conveniently chooses between archive, git, etc. GitHub repositories.
-    Prefer archives, as they're smaller and faster due to the lack of history.
+    split_on_anchor = url.split("#", 1)
+    split_on_query = split_on_anchor[0].split("?", 1)
+    split_on_scheme = split_on_query[0].split("://", 1)
+    if len(split_on_scheme) <= 1:  # Scheme is optional
+        split_on_scheme = [None] + split_on_scheme[:1]
+    split_on_path = split_on_scheme[1].split("/")
+    return {
+        "scheme": split_on_scheme[0],
+        "netloc": split_on_path[0].split("."),
+        "path": split_on_path[1:],
+        "query": split_on_query[1].split("&") if len(split_on_query) > 1 else None,
+        "fragment": split_on_anchor[1] if len(split_on_anchor) > 1 else None,
+    }
 
-    One of {commit, tag, branch} must also be provided (as usual).
-
-    sha256 should be omitted (or None) when the archive hash is unknown, then
-    updated ASAP to allow caching & avoid repeated downloads on every build.
-
-    If remote       == None , it is an error.
+def auto_http_archive(
+        *,
+        name = None,
+        url = None,
+        urls = True,
+        build_file = None,
+        build_file_content = None,
+        strip_prefix = True,
+        **kwargs):
+    """ Intelligently choose mirrors based on the given URL for the download.
+    Either url or urls is required.
     If name         == None , it is auto-deduced, but this is NOT recommended.
+    If urls         == True , mirrors are automatically chosen.
     If build_file   == True , it is auto-deduced.
     If strip_prefix == True , it is auto-deduced.
-    If url          == None , it is auto-deduced.
-    If sha256       != False, uses archive download (recommended; fast).
-    If sha256       == False, uses git clone (NOT recommended; slow).
-    If path         != None , local repository is assumed at the given path.
     """
-    GIT_SUFFIX = ".git"
-    archive_suffix = ".zip"
+    DOUBLE_SUFFIXES_LOWERCASE = [("tar", "bz2"), ("tar", "gz"), ("tar", "xz")]
+    mirror_prefixes = ["https://mirror.bazel.build/", "https://storage.googleapis.com/bazel-mirror"]
 
-    treeish = commit or tag or branch
-    if not treeish: fail("Missing commit, tag, or branch argument")
-    if remote == None: fail("Missing remote argument")
+    canonical_url = url if url != None else urls[0]
+    url_parts = urlsplit(canonical_url)
+    url_except_scheme = (canonical_url.replace(url_parts["scheme"] + "://", "") if url_parts["scheme"] != None else canonical_url)
+    url_path_parts = url_parts["path"]
+    url_filename = url_path_parts[-1]
+    url_filename_parts = (url_filename.rsplit(".", 2) if (tuple(url_filename.lower().rsplit(".", 2)[-2:]) in
+                                                          DOUBLE_SUFFIXES_LOWERCASE) else url_filename.rsplit(".", 1))
+    is_github = url_parts["netloc"] == ["github", "com"]
 
-    if remote.endswith(GIT_SUFFIX):
-        remote_no_suffix = remote[:len(remote) - len(GIT_SUFFIX)]
-    else:
-        remote_no_suffix = remote
-    project = remote_no_suffix.split("//", 1)[1].split("/")[2]
+    if name == None:  # Deduce "com_github_user_project_name" from "https://github.com/user/project-name/..."
+        name = "_".join(url_parts["netloc"][::-1] + url_path_parts[:2]).replace("-", "_")
 
-    if name == None:
-        name = project.replace("-", "_")
-    if strip_prefix == True:
-        strip_prefix = "%s-%s" % (project, treeish)
-    if url == None:
-        url = "%s/archive/%s%s" % (remote_no_suffix, treeish, archive_suffix)
+    # auto appending ray project namespace prefix for 3rd party library reusing.
     if build_file == True:
-        build_file = "@//%s:%s" % ("bazel", "BUILD." + name)
+        build_file = "@io_ray//%s:%s" % ("bazel", name + ".BUILD")
 
-    if path != None:
-        if build_file or build_file_content:
-            native.new_local_repository(name=name, path=path,
-                                        build_file=build_file,
-                                        build_file_content=build_file_content,
-                                        **kwargs)
-        else:
-            native.local_repository(name=name, path=path, **kwargs)
-    elif sha256 == False:
-        if build_file or build_file_content:
-            new_git_repository(name=name, remote=remote, build_file=build_file,
-                               commit=commit, tag=tag, branch=branch,
-                               shallow_since=shallow_since,
-                               build_file_content=build_file_content,
-                               strip_prefix=strip_prefix, **kwargs)
-        else:
-            git_repository(name=name, remote=remote, strip_prefix=strip_prefix,
-                           commit=commit, tag=tag, branch=branch,
-                           shallow_since=shallow_since, **kwargs)
+    if urls == True:
+        prefer_url_over_mirrors = is_github
+        urls = [
+            mirror_prefix + url_except_scheme
+            for mirror_prefix in mirror_prefixes
+            if not canonical_url.startswith(mirror_prefix)
+        ]
+        urls.insert(0 if prefer_url_over_mirrors else len(urls), canonical_url)
     else:
-        http_archive(name=name, url=url, sha256=sha256, build_file=build_file,
-                     strip_prefix=strip_prefix,
-                     build_file_content=build_file_content, **kwargs)
+        print("No implicit mirrors used for %s because urls were explicitly provided" % name)
+
+    if strip_prefix == True:
+        prefix_without_v = url_filename_parts[0]
+        if prefix_without_v.startswith("v") and prefix_without_v[1:2].isdigit():
+            # GitHub automatically strips a leading 'v' in version numbers
+            prefix_without_v = prefix_without_v[1:]
+        strip_prefix = (url_path_parts[1] + "-" + prefix_without_v if is_github and url_path_parts[2:3] == ["archive"] else url_filename_parts[0])
+
+    return http_archive(
+        name = name,
+        url = url,
+        urls = urls,
+        build_file = build_file,
+        build_file_content = build_file_content,
+        strip_prefix = strip_prefix,
+        **kwargs
+    )
 
 def ray_deps_setup():
-    github_repository(
-        name = "redis",
-        build_file = True,
-        tag = "5.0.3",
-        remote = "https://github.com/antirez/redis",
-        sha256 = "8e5997b447b1afdd1efd33731968484d2fe71c271fa7f1cd6b2476367e964e0e",
+    # Override build_bazel_rules_apple and build_bazel_apple_support before
+    # grpc_deps() runs. gRPC's rules_apple 1.1.3 uses apple_common.multi_arch_split
+    # which was removed in Bazel 7. rules_apple 3.2.1 is compatible with Bazel 6/7/8
+    # but requires apple_support >= 1.11.1 (for the configs/ package layout).
+    auto_http_archive(
+        name = "build_bazel_rules_apple",
+        sha256 = "9c4f1e1ec4fdfeac5bddb07fa0e872c398e3d8eb0ac596af9c463f9123ace292",
+        url = "https://github.com/bazelbuild/rules_apple/releases/download/3.2.1/rules_apple.3.2.1.tar.gz",
+        strip_prefix = "",
+    )
+
+    auto_http_archive(
+        name = "build_bazel_apple_support",
+        sha256 = "cf4d63f39c7ba9059f70e995bf5fe1019267d3f77379c2028561a5d7645ef67c",
+        url = "https://github.com/bazelbuild/apple_support/releases/download/1.11.1/apple_support.1.11.1.tar.gz",
+        strip_prefix = "",
         patches = [
-            "//thirdparty/patches:hiredis-async-include-dict.patch",
-            "//thirdparty/patches:hiredis-casts.patch",
-            "//thirdparty/patches:hiredis-connect-rename.patch",
-            "//thirdparty/patches:hiredis-windows-sigpipe.patch",
-            "//thirdparty/patches:hiredis-windows-sockets.patch",
-            "//thirdparty/patches:hiredis-windows-strerror.patch",
-            "//thirdparty/patches:hiredis-windows-poll.patch",
-            "//thirdparty/patches:redis-windows-poll.patch",
+            # In Bazel 7, local_config_apple_cc calls is_xcode_at_least_version
+            # during analysis. On CI machines with only Xcode CLT (no full Xcode
+            # app) xcode_config.xcode_version() returns None, causing a hard
+            # failure. Return False instead so the feature is disabled gracefully.
+            "//thirdparty/patches:build-bazel-apple-support-xcode.patch",
+        ],
+        patch_args = ["-p1"],
+    )
+
+    # Explicitly bring in protobuf dependency to work around
+    # https://github.com/ray-project/ray/issues/14117
+    # This is copied from grpc's bazel/grpc_deps.bzl
+    #
+    # Pinned grpc version: v23.4
+    auto_http_archive(
+        name = "com_google_protobuf",
+        sha256 = "76a33e2136f23971ce46c72fd697cd94dc9f73d56ab23b753c3e16854c90ddfd",
+        url = "https://github.com/protocolbuffers/protobuf/archive/2c5fa078d8e86e5f4bd34e6f4c9ea9e8d7d4d44a.tar.gz",
+        patches = [
+            "@com_github_grpc_grpc//third_party:protobuf.patch",
+            "//thirdparty/patches:protobuf-bazel7.patch",
+        ],
+        patch_args = ["-p1"],
+    )
+
+    # NOTE(lingxuan.zlx): 3rd party dependencies could be accessed, so it suggests
+    # all of http/git_repository should add prefix for patches defined in ray directory.
+    auto_http_archive(
+        name = "com_github_antirez_redis",
+        build_file = "@io_ray//bazel:redis.BUILD",
+        patch_args = ["-p1"],
+        url = "https://github.com/redis/redis/archive/refs/tags/7.2.3.tar.gz",
+        sha256 = "afd656dbc18a886f9a1cc08a550bf5eb89de0d431e713eba3ae243391fb008a6",
+        patches = [
+            "@io_ray//thirdparty/patches:redis-quiet.patch",
+        ],
+        workspace_file_content = 'workspace(name = "com_github_antirez_redis")',
+    )
+
+    auto_http_archive(
+        name = "com_github_redis_hiredis",
+        build_file = "@io_ray//bazel:hiredis.BUILD",
+        url = "https://github.com/redis/hiredis/archive/60e5075d4ac77424809f855ba3e398df7aacefe8.tar.gz",
+        sha256 = "b6d6f799b7714d85316f9ebfb76a35a78744f42ea3b6774289d882d13a2f0383",
+        patches = [
+            "@io_ray//thirdparty/patches:hiredis-windows-msvc.patch",
         ],
     )
 
-    github_repository(
+    auto_http_archive(
+        name = "com_github_spdlog",
+        build_file = "@io_ray//bazel:spdlog.BUILD",
+        url = "https://github.com/gabime/spdlog/archive/refs/tags/v1.15.3.zip",
+        sha256 = "b74274c32c8be5dba70b7006c1d41b7d3e5ff0dff8390c8b6390c1189424e094",
+        # spdlog rotation filename format conflict with ray, update the format.
+        patches = [
+            "@io_ray//thirdparty/patches:spdlog-rotation-file-format.patch",
+        ],
+        patch_args = ["-p1"],
+    )
+
+    auto_http_archive(
+        name = "com_github_tporadowski_redis_bin",
+        build_file = "@io_ray//bazel:redis.BUILD",
+        strip_prefix = None,
+        url = "https://github.com/tporadowski/redis/releases/download/v5.0.9/Redis-x64-5.0.9.zip",
+        sha256 = "b09565b22b50c505a5faa86a7e40b6683afb22f3c17c5e6a5e35fc9b7c03f4c2",
+    )
+
+    # RocksDB is the embedded storage backend for GCS fault tolerance
+    # (REP-64). It is built minimally via rules_foreign_cc's cmake() rule;
+    # see bazel/rocksdb.BUILD for the build configuration.
+    #
+    # Version constraint: pin to a RocksDB release that supports C++17.
+    # RocksDB 10.7.0 (Sep 2025) raised the minimum to C++20 for both the
+    # library and any code including its headers (GCC >= 11, Clang >= 10,
+    # MSVC >= 2019). Ray's .bazelrc sets `-std=c++17`, so bumping past
+    # 10.6.2 requires a coordinated C++20 migration across Ray. v10.6.2
+    # is the latest C++17-compatible release; keep it until/unless Ray
+    # itself moves to C++20.
+    auto_http_archive(
+        name = "com_github_facebook_rocksdb",
+        build_file = "@io_ray//bazel:rocksdb.BUILD",
+        url = "https://github.com/facebook/rocksdb/archive/refs/tags/v10.6.2.tar.gz",
+        sha256 = "14c619b8a10f994aa6061bd12182b20270c4c27c2f3d9cb4376d57f3cd1c5d7f",
+        patches = [
+            # WITH_TSAN=ON injects `-Wl,-pie`, which breaks every CMake
+            # try_compile under the rules_foreign_cc crosstool (clang +
+            # static libc++), aborting configure at find_package(Threads).
+            # `-fsanitize=thread` alone is sufficient for TSan.
+            "@io_ray//thirdparty/patches:rocksdb-tsan-no-pie.patch",
+        ],
+        patch_args = ["-p1"],
+    )
+
+    auto_http_archive(
         name = "rules_jvm_external",
-        tag = "2.10",
-        remote = "https://github.com/bazelbuild/rules_jvm_external",
-        sha256 = "1bbf2e48d07686707dd85357e9a94da775e1dbd7c464272b3664283c9c716d26",
+        url = "https://github.com/bazelbuild/rules_jvm_external/archive/2.10.tar.gz",
+        sha256 = "5c1b22eab26807d5286ada7392d796cbc8425d3ef9a57d114b79c5f8ef8aca7c",
     )
 
-    github_repository(
+    auto_http_archive(
         name = "bazel_common",
-        commit = "f1115e0f777f08c3cdb115526c4e663005bec69b",
-        remote = "https://github.com/google/bazel-common",
-        sha256 = "1e05a4791cc3470d3ecf7edb556f796b1d340359f1c4d293f175d4d0946cf84c",
+        url = "https://github.com/google/bazel-common/archive/084aadd3b854cad5d5e754a7e7d958ac531e6801.tar.gz",
+        sha256 = "a6e372118bc961b182a3a86344c0385b6b509882929c6b12dc03bb5084c775d5",
     )
 
-    github_repository(
-        name = "com_github_checkstyle_java",
-        commit = "ef367030d1433877a3360bbfceca18a5d0791bdd",
-        remote = "https://github.com/ray-project/checkstyle_java",
-        sha256 = "2fc33ec804011a03106e76ae77d7f1b09091b0f830f8e2a0408f079a032ed716",
-    )
-
-    http_archive(
-        # This rule is used by @com_github_nelhage_rules_boost and
-        # declaring it here allows us to avoid patching the latter.
-        name = "boost",
-        build_file = "@com_github_nelhage_rules_boost//:BUILD.boost",
-        sha256 = "da3411ea45622579d419bfda66f45cd0f8c32a181d84adfa936f5688388995cf",
-        strip_prefix = "boost_1_68_0",
-        url = "https://dl.bintray.com/boostorg/release/1.68.0/source/boost_1_68_0.tar.gz",
-        patches = [
-            "//thirdparty/patches:boost-exception-no_warn_typeid_evaluated.patch",
-            # Backport Clang-Cl patch on Boost 1.69 to Boost <= 1.68:
-            #   https://lists.boost.org/Archives/boost/2018/09/243420.php
-            "//thirdparty/patches:boost-type_traits-trivial_move.patch",
+    # Declare org_lzma_lzma before com_github_nelhage_rules_boost so that
+    # boost_deps()'s maybe() skips it and uses this declaration instead.
+    # Using a local build_file forces content-based cache invalidation:
+    # changing org_lzma_lzma.BUILD.bazel triggers re-setup on all machines,
+    # including Windows CI with persistent output bases where patching
+    # rules_boost's BUILD.lzma would not propagate (build_file label strings
+    # are used for fingerprinting, not file contents of external-repo labels).
+    auto_http_archive(
+        name = "org_lzma_lzma",
+        sha256 = "06327c2ddc81e126a6d9a78b0be5014b976a2c0832f492dcfc4755d7facf6d33",
+        strip_prefix = "xz-5.2.7",
+        urls = [
+            # Use the SourceForge redirector, which picks a live mirror,
+            # instead of pinning specific mirrors that can go offline.
+            "https://downloads.sourceforge.net/project/lzmautils/xz-5.2.7.tar.gz",
+            "https://tukaani.org/xz/xz-5.2.7.tar.gz",
         ],
+        build_file = "//thirdparty/patches:org_lzma_lzma.BUILD.bazel",
     )
 
-    github_repository(
+    auto_http_archive(
         name = "com_github_nelhage_rules_boost",
         # If you update the Boost version, remember to update the 'boost' rule.
-        commit = "df908358c605a7d5b8bbacde07afbaede5ac12cf",
-        remote = "https://github.com/nelhage/rules_boost",
-        sha256 = "3775c5ab217e0c9cc380f56e243a4d75fe6fee8eaee1447899eaa04c5d582cf1",
+        url = "https://github.com/nelhage/rules_boost/archive/57c99395e15720e287471d79178d36a85b64d6f6.tar.gz",
+        sha256 = "490d11425393eed068966a4990ead1ff07c658f823fd982fddac67006ccc44ab",
         patches = [
-            "//thirdparty/patches:rules_boost-undefine-boost_fallthrough.patch",
+            "//thirdparty/patches:boost-headers.patch",
         ],
+        patch_args = ["-p1"],
     )
 
-    github_repository(
+    auto_http_archive(
         name = "com_github_google_flatbuffers",
-        commit = "63d51afd1196336a7d1f56a988091ef05deb1c62",
-        remote = "https://github.com/google/flatbuffers",
-        sha256 = "dd87be0acf932c9b0d9b5d7bb49aec23e1c98bbd3327254bd90cb4af198f9332",
+        url = "https://github.com/google/flatbuffers/archive/refs/tags/v25.2.10.tar.gz",
+        sha256 = "b9c2df49707c57a48fc0923d52b8c73beb72d675f9d44b2211e4569be40a7421",
     )
 
-    github_repository(
+    auto_http_archive(
         name = "com_google_googletest",
-        commit = "3306848f697568aacf4bcca330f6bdd5ce671899",
-        remote = "https://github.com/google/googletest",
-        sha256 = "2625a1d301cd658514e297002170c2fc83a87beb0f495f943601df17d966511d",
+        url = "https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz",
+        sha256 = "8ad598c73ad796e0d8280b082cebd82a630d73e73cd3c70057938a6501bba5d7",
     )
 
-    github_repository(
+    auto_http_archive(
         name = "com_github_gflags_gflags",
-        commit = "e171aa2d15ed9eb17054558e0b3a6a413bb01067",
-        remote = "https://github.com/gflags/gflags",
-        sha256 = "da72f0dce8e3422d0ab2fea8d03a63a64227b0376b3558fd9762e88de73b780b",
+        url = "https://github.com/gflags/gflags/archive/e171aa2d15ed9eb17054558e0b3a6a413bb01067.tar.gz",
+        sha256 = "b20f58e7f210ceb0e768eb1476073d0748af9b19dfbbf53f4fd16e3fb49c5ac8",
     )
 
-    github_repository(
-        name = "com_github_google_glog",
-        commit = "925858d9969d8ee22aabc3635af00a37891f4e25",
-        remote = "https://github.com/google/glog",
-        sha256 = "dbe787f2a7cf1146f748a191c99ae85d6b931dd3ebdcc76aa7ccae3699149c67",
-        patches = [
-            "//thirdparty/patches:glog-stack-trace.patch",
-        ],
-    )
-
-    github_repository(
-        name = "plasma",
-        build_file = True,
-        commit = "86f34aa07e611787d9cc98c6a33b0a0a536dce57",
-        remote = "https://github.com/apache/arrow",
-        sha256 = "4f1956e74188fa15078c8ad560bbc298624320d2aafd21fe7a2511afee7ea841",
-        patches = [
-            "//thirdparty/patches:arrow-headers-unused.patch",
-            "//thirdparty/patches:arrow-windows-export.patch",
-            "//thirdparty/patches:arrow-windows-poll.patch",
-            "//thirdparty/patches:arrow-windows-sigpipe.patch",
-            "//thirdparty/patches:arrow-windows-socket.patch",
-        ],
-    )
-
-    github_repository(
+    auto_http_archive(
         name = "cython",
         build_file = True,
-        commit = "49414dbc7ddc2ca2979d6dbe1e44714b10d72e7e",
-        remote = "https://github.com/cython/cython",
-        sha256 = "aaee5dec23165ee10c189d8b40f19861e2c6929c015cee3d2b4e56d8a1bdc422",
+        url = "https://github.com/cython/cython/archive/refs/tags/3.0.12.tar.gz",
+        sha256 = "a156fff948c2013f2c8c398612c018e2b52314fdf0228af8fbdb5585e13699c2",
+        patches = [
+            # Use python3 rather than python. macos does not have python installed
+            # by default, and hermetic strict action does not work as python cannot
+            # be found under /usr/bin or any systeme PATH in bazel sandbox.
+            #
+            # This patch can be removed after the following change is included.
+            # https://github.com/cython/cython/pull/7053
+            "//thirdparty/patches:cython.patch",
+        ],
     )
 
-    github_repository(
+    auto_http_archive(
+        name = "com_github_johnynek_bazel_jar_jar",
+        url = "https://github.com/johnynek/bazel_jar_jar/archive/171f268569384c57c19474b04aebe574d85fde0d.tar.gz",
+        sha256 = "97c5f862482a05f385bd8f9d28a9bbf684b0cf3fae93112ee96f3fb04d34b193",
+    )
+
+    auto_http_archive(
         name = "io_opencensus_cpp",
-        commit = "3aa11f20dd610cb8d2f7c62e58d1e69196aadf11",
-        remote = "https://github.com/census-instrumentation/opencensus-cpp",
-        sha256 = "92eef77c44d01e8472f68a2f1329919a1bb59317a4bb1e4d76081ab5c13a56d6",
+        url = "https://github.com/census-instrumentation/opencensus-cpp/archive/5e5f2632c84e2230fb7ccb8e336f603d2ec6aa1b.zip",
+        sha256 = "1b88d6663f05c6a56c1604eb2afad22831d5f28a76f6fab8f37187f1e4ace425",
+        patches = [
+            "@io_ray//thirdparty/patches:opencensus-cpp-harvest-interval.patch",
+            "@io_ray//thirdparty/patches:opencensus-cpp-shutdown-api.patch",
+        ],
+        patch_args = ["-p1"],
+    )
+
+    # WARNING: Upgrading the OTEL version caused a major regression in actor creation/task throughput.
+    # Verify that this regression is fixed before upgrading the below two OTEL versions.
+    auto_http_archive(
+        name = "io_opentelemetry_cpp",
+        url = "https://github.com/open-telemetry/opentelemetry-cpp/archive/refs/tags/v1.19.0.zip",
+        sha256 = "8ef0a63f4959d5dfc3d8190d62229ef018ce41eef36e1f3198312d47ab2de05a",
+        # Enable mTLS support for OTLP gRPC exporter.
+        # This is required because Ray's gRPC servers require client certificates when TLS is enabled.
+        # See https://github.com/ray-project/ray/issues/59968
+        patches = [
+            "@io_ray//thirdparty/patches:opentelemetry-cpp-enable-mtls.patch",
+        ],
+        patch_args = ["-p1"],
+    )
+
+    auto_http_archive(
+        name = "com_github_opentelemetry_proto",
+        url = "https://github.com/open-telemetry/opentelemetry-proto/archive/refs/tags/v1.2.0.zip",
+        build_file = "@io_opentelemetry_cpp//bazel:opentelemetry_proto.BUILD",
+        sha256 = "b3cf4fefa4eaea43879ade612639fa7029c624c1b959f019d553b86ad8e01e82",
     )
 
     # OpenCensus depends on Abseil so we have to explicitly pull it in.
     # This is how diamond dependencies are prevented.
-    github_repository(
+    #
+    # TODO(owner): Upgrade abseil to latest version after protobuf updated, which requires to upgrade `rules_cc` first.
+    auto_http_archive(
         name = "com_google_absl",
-        commit = "aa844899c937bde5d2b24f276b59997e5b668bde",
-        remote = "https://github.com/abseil/abseil-cpp",
-        sha256 = "f1a959a2144f0482b9bd61e67a9897df02234fff6edf82294579a4276f2f4b97",
-    )
-
-    # OpenCensus depends on jupp0r/prometheus-cpp
-    github_repository(
-        name = "com_github_jupp0r_prometheus_cpp",
-        commit = "60eaa4ea47b16751a8e8740b05fe70914c68a480",
-        remote = "https://github.com/jupp0r/prometheus-cpp",
-        sha256 = "9756bd2d573e7722f97dbe6d35934e43b9a79e6a87fc5e1da79774a621cddd8e",
+        sha256 = "987ce98f02eefbaf930d6e38ab16aa05737234d7afbab2d5c4ea7adbe50c28ed",
+        url = "https://github.com/abseil/abseil-cpp/archive/refs/tags/20230802.1.tar.gz",
         patches = [
-            # https://github.com/jupp0r/prometheus-cpp/pull/225
-            "//thirdparty/patches:prometheus-windows-zlib.patch",
-            "//thirdparty/patches:prometheus-windows-pollfd.patch",
-        ]
-    )
-
-    github_repository(
-        name = "com_github_grpc_grpc",
-        commit = "4790ab6d97e634a1ede983be393f3bb3c132b2f7",
-        remote = "https://github.com/grpc/grpc",
-        sha256 = "723853c36ea6d179d32a4f9f2f8691dbe0e28d5bbc521c954b34355a1c952ba5",
-        patches = [
-            "//thirdparty/patches:grpc-command-quoting.patch",
-            "//thirdparty/patches:grpc-cython-copts.patch",
+            # TODO (israbbani): #55430 Separate the compiler flags and remove this patch
+            "@io_ray//thirdparty/patches:abseil-cpp-shadow.patch",
         ],
     )
 
-    github_repository(
+    # OpenCensus depends on jupp0r/prometheus-cpp
+    auto_http_archive(
+        name = "com_github_jupp0r_prometheus_cpp",
+        url = "https://github.com/jupp0r/prometheus-cpp/archive/60eaa4ea47b16751a8e8740b05fe70914c68a480.tar.gz",
+        sha256 = "ec825b802487ac18b0d98e2e8b7961487b12562f8f82e424521d0a891d9e1373",
+        patches = [
+            "@io_ray//thirdparty/patches:prometheus-windows-headers.patch",
+            # https://github.com/jupp0r/prometheus-cpp/pull/225
+            "@io_ray//thirdparty/patches:prometheus-windows-zlib.patch",
+            "@io_ray//thirdparty/patches:prometheus-windows-pollfd.patch",
+            "@io_ray//thirdparty/patches:prometheus-zlib-fdopen.patch",
+        ],
+    )
+
+    auto_http_archive(
+        name = "com_github_grpc_grpc",
+        # NOTE: If you update this, also update @boringssl's hash.
+        url = "https://github.com/grpc/grpc/archive/refs/tags/v1.58.0.tar.gz",
+        sha256 = "ec64fdab22726d50fc056474dd29401d914cc616f53ab8f2fe4866772881d581",
+        patches = [
+            "@io_ray//thirdparty/patches:grpc-cython-copts.patch",
+            # Work around bazelbuild/bazel#21592: with layering_check and
+            # non-sandbox/local spawn, clang can record transitive *.cppmap files
+            # in .d files, which Bazel then reports as undeclared direct deps.
+            # Fixed in Bazel 7.3.0. LLVM used the same workaround by disabling
+            # layering_check in Bazel overlays (llvm/llvm-project@5bba176).
+            "@io_ray//thirdparty/patches:grpc-disable-layering-check.patch",
+            "@io_ray//thirdparty/patches:grpc-zlib-fdopen.patch",
+            "@io_ray//thirdparty/patches:grpc-configurable-thread-count.patch",
+            "@io_ray//thirdparty/patches:grpc-nextresult-cancelled-init.patch",
+        ],
+    )
+
+    auto_http_archive(
+        name = "openssl",
+        strip_prefix = "openssl-1.1.1f",
+        sha256 = "186c6bfe6ecfba7a5b48c47f8a1673d0f3b0e5ba2e25602dd23b629975da3f35",
+        urls = [
+            "https://openssl.org/source/old/1.1.1/openssl-1.1.1f.tar.gz",
+        ],
+        build_file = "@rules_foreign_cc_thirdparty//openssl:BUILD.openssl.bazel",
+    )
+
+    auto_http_archive(
+        name = "rules_foreign_cc",
+        sha256 = "2a4d07cd64b0719b39a7c12218a3e507672b82a97b98c6a89d38565894cf7c51",
+        url = "https://github.com/bazelbuild/rules_foreign_cc/archive/refs/tags/0.9.0.tar.gz",
+    )
+
+    # Using shallow_since allows the rule to clone down fewer commits.
+    # Reference:  https://bazel.build/rules/lib/repo/git
+    git_repository(
+        name = "rules_perl",
+        remote = "https://github.com/bazelbuild/rules_perl.git",
+        commit = "022b8daf2bb4836ac7a50e4a1d8ea056a3e1e403",
+        shallow_since = "1663780239 -0700",
+    )
+
+    auto_http_archive(
+        name = "rules_foreign_cc_thirdparty",
+        sha256 = "2a4d07cd64b0719b39a7c12218a3e507672b82a97b98c6a89d38565894cf7c51",
+        strip_prefix = "rules_foreign_cc-0.9.0/examples/third_party",
+        url = "https://github.com/bazelbuild/rules_foreign_cc/archive/refs/tags/0.9.0.tar.gz",
+    )
+
+    auto_http_archive(
+        # This rule is used by @com_github_grpc_grpc, and using a GitHub mirror
+        # provides a deterministic archive hash for caching. Explanation here:
+        # https://github.com/grpc/grpc/blob/1ff1feaa83e071d87c07827b0a317ffac673794f/bazel/grpc_deps.bzl#L189
+        # Ensure this rule matches the rule used by grpc's bazel/grpc_deps.bzl
+        name = "boringssl",
+        sha256 = "b21994a857a7aa6d5256ffe355c735ad4c286de44c6c81dfc04edc41a8feaeef",
+        url = "https://github.com/google/boringssl/archive/2ff4b968a7e0cfee66d9f151cb95635b43dc1d5b.tar.gz",
+    )
+
+    # The protobuf version we use to auto generate python and java code.
+    # This can be different from the protobuf version that Ray core uses internally.
+    # Generally this should be a lower version since protobuf guarantees that
+    # code generated by protoc of version X can be used with protobuf library of version >= X.
+    # So the version here effectively determines the lower bound of python/java
+    # protobuf library that Ray supports.
+    # Declared before protobuf_deps() so its maybe() skips its own rules_pkg.
+    # 0.9.1 is the ceiling: the v3.20.3 protobuf below loads the root
+    # @rules_pkg//:providers.bzl stub, which rules_pkg 0.10.0 deleted.
+    # Protobuf 29 only uses the //pkg: paths, which 0.9.1 also has.
+    auto_http_archive(
+        name = "rules_pkg",
+        url = "https://github.com/bazelbuild/rules_pkg/releases/download/0.9.1/rules_pkg-0.9.1.tar.gz",
+        sha256 = "8f9ee2dc10c1ae514ee599a8b42ed99fa262b757058f65ad3c384289ff70c4b8",
+        strip_prefix = None,
+    )
+    auto_http_archive(
+        name = "com_google_protobuf_rules_proto_grpc",
+        url = "https://github.com/protocolbuffers/protobuf/archive/v3.20.3.tar.gz",
+        sha256 = "9c0fd39c7a08dff543c643f0f4baf081988129a411b977a07c46221793605638",
+    )
+    auto_http_archive(
         name = "rules_proto_grpc",
-        commit = "a74fef39c5fe636580083545f76d1eab74f6450d",
-        remote = "https://github.com/rules-proto-grpc/rules_proto_grpc",
-        sha256 = "53561ecacaebe58916dfdb962d889a56394d3fae6956e0bcd63c4353f813284a",
+        url = "https://github.com/rules-proto-grpc/rules_proto_grpc/archive/a74fef39c5fe636580083545f76d1eab74f6450d.tar.gz",
+        sha256 = "2f6606151ec042e23396f07de9e7dcf6ca9a5db1d2b09f0cc93a7fc7f4008d1b",
+        repo_mapping = {
+            "@com_google_protobuf": "@com_google_protobuf_rules_proto_grpc",
+        },
+    )
+
+    auto_http_archive(
+        name = "msgpack",
+        build_file = True,
+        url = "https://github.com/msgpack/msgpack-c/archive/8085ab8721090a447cf98bb802d1406ad7afe420.tar.gz",
+        sha256 = "83c37c9ad926bbee68d564d9f53c6cbb057c1f755c264043ddd87d89e36d15bb",
+        patches = [
+            "@io_ray//thirdparty/patches:msgpack-windows-iovec.patch",
+            # TODO (israbbani): #55430 Separate the compiler flags and remove this patch
+            "@io_ray//thirdparty/patches:msgpack-shadow.patch",
+        ],
+    )
+
+    auto_http_archive(
+        name = "io_opencensus_proto",
+        strip_prefix = "opencensus-proto-0.3.0/src",
+        url = "https://github.com/census-instrumentation/opencensus-proto/archive/v0.3.0.tar.gz",
+        sha256 = "b7e13f0b4259e80c3070b583c2f39e53153085a6918718b1c710caf7037572b0",
+    )
+
+    auto_http_archive(
+        name = "nlohmann_json",
+        url = "https://github.com/nlohmann/json/archive/v3.9.1.tar.gz",
+        sha256 = "4cf0df69731494668bdd6460ed8cb269b68de9c19ad8c27abc24cd72605b2d5b",
+        build_file = "@io_ray//bazel:nlohmann_json.BUILD",
+    )
+
+    auto_http_archive(
+        name = "rapidjson",
+        url = "https://github.com/Tencent/rapidjson/archive/v1.1.0.zip",
+        build_file = True,
+        sha256 = "8e00c38829d6785a2dfb951bb87c6974fa07dfe488aa5b25deec4b8bc0f6a3ab",
+    )
+
+    # Hedron's Compile Commands Extractor for Bazel
+    # https://github.com/hedronvision/bazel-compile-commands-extractor
+    auto_http_archive(
+        name = "hedron_compile_commands",
+
+        # Replace the commit hash in both places (below) with the latest, rather than using the stale one here.
+        # Even better, set up Renovate and let it do the work for you (see "Suggestion: Updates" in the README).
+        url = "https://github.com/hedronvision/bazel-compile-commands-extractor/archive/2e8b7654fa10c44b9937453fa4974ed2229d5366.tar.gz",
+        # When you first run this tool, it'll recommend a sha256 hash to put here with a message like: "DEBUG: Rule 'hedron_compile_commands' indicated that a canonical reproducible form can be obtained by modifying arguments sha256 = ..."
+        sha256 = "7fbbbc05c112c44e9b406612e6a7a7f4789a6918d7aacefef4c35c105286930c",
+    )
+
+    auto_http_archive(
+        name = "jemalloc",
+        url = "https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2",
+        build_file = "@io_ray//bazel:jemalloc.BUILD",
+        sha256 = "2db82d1e7119df3e71b7640219b6dfe84789bc0537983c3b7ac4f7189aecfeaa",
+        strip_prefix = "jemalloc-5.3.0",
     )

@@ -1,197 +1,299 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
+# isort: skip_file
+from ray._private import log  # isort: skip # noqa: F401
+import logging
 import os
-from os.path import dirname
 import sys
+from typing import TYPE_CHECKING
 
-# MUST add pickle5 to the import path because it will be imported by some
-# raylet modules.
+log.generate_logging_config()
+logger = logging.getLogger(__name__)
 
-if "pickle5" in sys.modules:
-    raise ImportError("Ray must be imported before pickle5 because Ray "
-                      "requires a specific version of pickle5 (which is "
-                      "packaged along with Ray).")
 
-# Add the directory containing pickle5 to the Python path so that we find the
-# pickle5 version packaged with ray and not a pre-existing pickle5.
-pickle5_path = os.path.join(
-    os.path.abspath(os.path.dirname(__file__)), "pickle5_files")
-sys.path.insert(0, pickle5_path)
+def _configure_system():
+    import os
+    import platform
+    import sys
 
-# Expose ray ABI symbols which may be dependent by other shared
-# libraries such as _streaming.so. See BUILD.bazel:_raylet
-so_path = os.path.join(dirname(__file__), "_raylet.so")
-if os.path.exists(so_path):
-    import ctypes
-    from ctypes import CDLL
-    CDLL(so_path, ctypes.RTLD_GLOBAL)
+    """Wraps system configuration to avoid 'leaking' variables into ray."""
 
-# MUST import ray._raylet before pyarrow to initialize some global variables.
-# It seems the library related to memory allocation in pyarrow will destroy the
-# initialization of grpc if we import pyarrow at first.
-# NOTE(JoeyJiang): See https://github.com/ray-project/ray/issues/5219 for more
-# details.
+    # Sanity check pickle5 if it has been installed.
+    if "pickle5" in sys.modules:
+        if sys.version_info >= (3, 8):
+            logger.warning(
+                "Package pickle5 becomes unnecessary in Python 3.8 and above. "
+                "Its presence may confuse libraries including Ray. "
+                "Please uninstall the package."
+            )
+
+        import importlib.metadata
+
+        try:
+            version_str = importlib.metadata.version("pickle5")
+            version = tuple(int(n) for n in version_str.split("."))
+            if version < (0, 0, 10):
+                logger.warning(
+                    "Although not used by Ray, a version of pickle5 that leaks memory "
+                    "is found in the environment. Please run 'pip install pickle5 -U' "
+                    "to upgrade."
+                )
+        except importlib.metadata.PackageNotFoundError:
+            logger.warning(
+                "You are using the 'pickle5' module, but "
+                "the exact version is unknown (possibly carried as "
+                "an internal component by another module). Please "
+                "make sure you are using pickle5 >= 0.0.10 because "
+                "previous versions may leak memory."
+            )
+
+    # Importing psutil. Must be before ray._raylet is
+    # initialized.
+    thirdparty_files = os.path.join(
+        os.path.abspath(os.path.dirname(__file__)), "thirdparty_files"
+    )
+    sys.path.insert(0, thirdparty_files)
+
+    if (
+        platform.system() == "Linux"
+        and "Microsoft".lower() in platform.release().lower()
+    ):
+        from ray._private import compat  # noqa: E402
+
+        compat.patch_psutil()
+
+    # Expose ray ABI symbols which may be dependent by other shared
+    # libraries such as _streaming.so. See BUILD.bazel:_raylet
+    python_shared_lib_suffix = ".so" if sys.platform != "win32" else ".pyd"
+    so_path = os.path.join(
+        os.path.dirname(__file__), "_raylet" + python_shared_lib_suffix
+    )
+    if os.path.exists(so_path):
+        import ctypes
+        from ctypes import CDLL
+
+        CDLL(so_path, ctypes.RTLD_GLOBAL)
+
+
+_configure_system()
+# Delete configuration function.
+del _configure_system
+
+from ray import _version  # noqa: E402
+
+__commit__ = _version.commit
+__version__ = _version.version
+
 import ray._raylet  # noqa: E402
 
-if "pyarrow" in sys.modules:
-    raise ImportError("Ray must be imported before pyarrow because Ray "
-                      "requires a specific version of pyarrow (which is "
-                      "packaged along with Ray).")
-
-# Add the directory containing pyarrow to the Python path so that we find the
-# pyarrow version packaged with ray and not a pre-existing pyarrow.
-pyarrow_path = os.path.join(
-    os.path.abspath(os.path.dirname(__file__)), "pyarrow_files")
-sys.path.insert(0, pyarrow_path)
-
-# See https://github.com/ray-project/ray/issues/131.
-helpful_message = """
-
-If you are using Anaconda, try fixing this problem by running:
-
-    conda install libgcc
-"""
-
-try:
-    import pyarrow  # noqa: F401
-
-    # pyarrow is not imported inside of _raylet because of the issue described
-    # above. In order for Cython to compile _raylet, pyarrow is set to None
-    # in _raylet instead, so we give _raylet a real reference to it here.
-    # We first do the attribute checks here so that building the documentation
-    # succeeds without fully installing ray..
-    # TODO(edoakes): Fix this.
-    if hasattr(ray, "_raylet") and hasattr(ray._raylet, "pyarrow"):
-        ray._raylet.pyarrow = pyarrow
-except ImportError as e:
-    if ((hasattr(e, "msg") and isinstance(e.msg, str)
-         and ("libstdc++" in e.msg or "CXX" in e.msg))):
-        # This code path should be taken with Python 3.
-        e.msg += helpful_message
-    elif (hasattr(e, "message") and isinstance(e.message, str)
-          and ("libstdc++" in e.message or "CXX" in e.message)):
-        # This code path should be taken with Python 2.
-        condition = (hasattr(e, "args") and isinstance(e.args, tuple)
-                     and len(e.args) == 1 and isinstance(e.args[0], str))
-        if condition:
-            e.args = (e.args[0] + helpful_message, )
-        else:
-            if not hasattr(e, "args"):
-                e.args = ()
-            elif not isinstance(e.args, tuple):
-                e.args = (e.args, )
-            e.args += (helpful_message, )
-    raise
-
-from ray._raylet import (
-    ActorCheckpointID,
+from ray._raylet import (  # noqa: E402,F401
     ActorClassID,
     ActorID,
-    ClientID,
+    NodeID,
     Config as _Config,
     JobID,
     WorkerID,
     FunctionID,
     ObjectID,
+    ObjectRef,
+    ObjectRefGenerator,
+    DynamicObjectRefGenerator,
     TaskID,
     UniqueID,
-)  # noqa: E402
+    Language,
+    PlacementGroupID,
+    ClusterID,
+)
 
 _config = _Config()
 
-from ray.profiling import profile  # noqa: E402
-from ray.state import (global_state, jobs, nodes, tasks, objects, timeline,
-                       object_transfer_timeline, cluster_resources,
-                       available_resources, errors)  # noqa: E402
-from ray.worker import (
-    LOCAL_MODE,
+from ray._private.state import (  # noqa: E402,F401
+    nodes,
+    timeline,
+    cluster_resources,
+    available_resources,
+)
+from ray._private.worker import (  # noqa: E402,F401
     SCRIPT_MODE,
     WORKER_MODE,
-    connect,
-    disconnect,
+    RESTORE_WORKER_MODE,
+    SPILL_WORKER_MODE,
+    cancel,
     get,
+    get_actor,
     get_gpu_ids,
-    get_resource_ids,
-    get_webui_url,
     init,
     is_initialized,
     put,
-    register_custom_serializer,
+    kill,
     remote,
     shutdown,
     wait,
-)  # noqa: E402
-import ray.internal  # noqa: E402
-import ray.projects  # noqa: E402
+)
+
+from ray._private.ray_logging.logging_config import LoggingConfig  # noqa: E402
+
 # We import ray.actor because some code is run in actor.py which initializes
 # some functions in the worker.
-import ray.actor  # noqa: F401
-from ray.actor import method  # noqa: E402
-from ray.runtime_context import _get_runtime_context  # noqa: E402
+import ray.actor  # noqa: E402,F401
+from ray.actor import method  # noqa: E402,F401
 
-# Ray version string.
-__version__ = "0.9.0.dev"
+# TODO(qwang): We should remove this exporting in Ray2.0.
+from ray.cross_language import java_function, java_actor_class  # noqa: E402,F401
+from ray.runtime_context import get_runtime_context  # noqa: E402,F401
+from ray import internal  # noqa: E402,F401
+from ray import util  # noqa: E402,F401
+from ray import _private  # noqa: E402,F401
 
+# We import ClientBuilder so that modules can inherit from `ray.ClientBuilder`.
+from ray.client_builder import client, ClientBuilder  # noqa: E402,F401
+
+
+class _DeprecationWrapper:
+    def __init__(self, name, real_worker):
+        self._name = name
+        self._real_worker = real_worker
+        self._warned = set()
+
+    def __getattr__(self, attr):
+        value = getattr(self._real_worker, attr)
+        if attr not in self._warned:
+            self._warned.add(attr)
+            logger.warning(
+                f"DeprecationWarning: `ray.{self._name}.{attr}` is a private "
+                "attribute and access will be removed in a future Ray version."
+            )
+        return value
+
+
+# TODO(ekl) remove this entirely after 3rd party libraries are all migrated.
+worker = _DeprecationWrapper("worker", ray._private.worker)
+ray_constants = _DeprecationWrapper("ray_constants", ray._private.ray_constants)
+serialization = _DeprecationWrapper("serialization", ray._private.serialization)
+state = _DeprecationWrapper("state", ray._private.state)
+
+
+# Pulic Ray APIs
 __all__ = [
-    "global_state",
-    "jobs",
-    "nodes",
-    "tasks",
-    "objects",
-    "timeline",
-    "object_transfer_timeline",
-    "cluster_resources",
+    "__version__",
+    "_config",
+    "get_runtime_context",
+    "autoscaler",
     "available_resources",
-    "errors",
-    "LOCAL_MODE",
-    "PYTHON_MODE",
+    "cancel",
+    "client",
+    "ClientBuilder",
+    "cluster_resources",
+    "get",
+    "get_actor",
+    "get_gpu_ids",
+    "init",
+    "is_initialized",
+    "java_actor_class",
+    "java_function",
+    "cpp_function",
+    "kill",
+    "Language",
+    "method",
+    "nodes",
+    "put",
+    "remote",
+    "shutdown",
+    "timeline",
+    "wait",
+    "SCRIPT_MODE",
+    "WORKER_MODE",
+    "LoggingConfig",
+]
+
+# Public APIs that should automatically trigger ray.init().
+AUTO_INIT_APIS = {
+    "cancel",
+    "get",
+    "get_actor",
+    "get_gpu_ids",
+    "kill",
+    "put",
+    "wait",
+    "get_runtime_context",
+}
+
+# Public APIs that should not automatically trigger ray.init().
+NON_AUTO_INIT_APIS = {
+    "ClientBuilder",
+    "Language",
     "SCRIPT_MODE",
     "WORKER_MODE",
     "__version__",
     "_config",
-    "_get_runtime_context",
-    "actor",
-    "connect",
-    "disconnect",
-    "get",
-    "get_gpu_ids",
-    "get_resource_ids",
-    "get_webui_url",
+    "autoscaler",
+    "available_resources",
+    "client",
+    "cluster_resources",
+    "cpp_function",
     "init",
-    "internal",
     "is_initialized",
+    "java_actor_class",
+    "java_function",
     "method",
-    "profile",
-    "projects",
-    "put",
-    "register_custom_serializer",
+    "nodes",
     "remote",
     "shutdown",
-    "wait",
+    "timeline",
+    "LoggingConfig",
+}
+
+assert set(__all__) == AUTO_INIT_APIS | NON_AUTO_INIT_APIS
+from ray._private.auto_init_hook import wrap_auto_init_for_all_apis  # noqa: E402
+
+wrap_auto_init_for_all_apis(AUTO_INIT_APIS)
+del wrap_auto_init_for_all_apis
+
+# Subpackages
+__all__ += [
+    "actor",
+    "autoscaler",
+    "data",
+    "internal",
+    "util",
+    "widgets",
+    "workflow",
 ]
 
 # ID types
 __all__ += [
-    "ActorCheckpointID",
     "ActorClassID",
     "ActorID",
-    "ClientID",
+    "NodeID",
     "JobID",
     "WorkerID",
     "FunctionID",
     "ObjectID",
+    "ObjectRef",
+    "ObjectRefGenerator",
+    "DynamicObjectRefGenerator",
     "TaskID",
     "UniqueID",
+    "PlacementGroupID",
 ]
 
-import ctypes  # noqa: E402
-# Windows only
-if hasattr(ctypes, "windll"):
-    # Makes sure that all child processes die when we die. Also makes sure that
-    # fatal crashes result in process termination rather than an error dialog
-    # (the latter is annoying since we have a lot of processes). This is done
-    # by associating all child processes with a "job" object that imposes this
-    # behavior.
-    (lambda kernel32: (lambda job: (lambda n: kernel32.SetInformationJobObject(job, 9, "\0" * 17 + chr(0x8 | 0x4 | 0x20) + "\0" * (n - 18), n))(0x90 if ctypes.sizeof(ctypes.c_void_p) > ctypes.sizeof(ctypes.c_int) else 0x70) and kernel32.AssignProcessToJobObject(job, ctypes.c_void_p(kernel32.GetCurrentProcess())))(ctypes.c_void_p(kernel32.CreateJobObjectW(None, None))) if kernel32 is not None else None)(ctypes.windll.kernel32)  # noqa: E501
+
+# Delay importing of expensive, isolated subpackages. Note that for proper type
+# checking support these imports must be kept in sync between type checking and
+# runtime behavior.
+if TYPE_CHECKING:
+    from ray import autoscaler
+    from ray import data
+    from ray import workflow
+else:
+
+    def __getattr__(name: str):
+        import importlib
+
+        if name in ["data", "workflow", "autoscaler"]:
+            return importlib.import_module("." + name, __name__)
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+del os
+del logging
+del sys
+del TYPE_CHECKING

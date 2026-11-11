@@ -1,218 +1,133 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import json
 import logging
 import os
+import signal
 import sys
-import tempfile
 import threading
 import time
 
 import numpy as np
 import pytest
-import redis
 
 import ray
-import ray.ray_constants as ray_constants
-from ray.cluster_utils import Cluster
-from ray.test_utils import (
-    relevant_errors,
-    wait_for_errors,
-    RayTestTimeoutException,
+import ray._private.ray_constants as ray_constants
+import ray._private.utils
+from ray._common.test_utils import SignalActor, wait_for_condition
+from ray._private.test_utils import (
+    get_error_message,
+    init_error_pubsub,
 )
+from ray.exceptions import ActorDiedError, GetTimeoutError, RayActorError, RayTaskError
 
-RAY_FORCE_DIRECT = ray_constants.direct_call_enabled()
 
-
-def test_failed_task(ray_start_regular):
-    @ray.remote
-    def throw_exception_fct1():
-        raise Exception("Test function 1 intentionally failed.")
-
-    @ray.remote
-    def throw_exception_fct2():
-        raise Exception("Test function 2 intentionally failed.")
-
-    @ray.remote(num_return_vals=3)
-    def throw_exception_fct3(x):
-        raise Exception("Test function 3 intentionally failed.")
-
-    throw_exception_fct1.remote()
-    throw_exception_fct1.remote()
-    wait_for_errors(ray_constants.TASK_PUSH_ERROR, 2)
-    assert len(relevant_errors(ray_constants.TASK_PUSH_ERROR)) == 2
-    for task in relevant_errors(ray_constants.TASK_PUSH_ERROR):
-        msg = task.get("message")
-        assert "Test function 1 intentionally failed." in msg
-
-    x = throw_exception_fct2.remote()
-    try:
-        ray.get(x)
-    except Exception as e:
-        assert "Test function 2 intentionally failed." in str(e)
-    else:
-        # ray.get should throw an exception.
-        assert False
-
-    x, y, z = throw_exception_fct3.remote(1.0)
-    for ref in [x, y, z]:
-        try:
-            ray.get(ref)
-        except Exception as e:
-            assert "Test function 3 intentionally failed." in str(e)
-        else:
-            # ray.get should throw an exception.
-            assert False
-
-    class CustomException(ValueError):
-        pass
-
+def test_unhandled_errors(ray_start_regular):
     @ray.remote
     def f():
-        raise CustomException("This function failed.")
+        raise ValueError()
 
+    @ray.remote
+    class Actor:
+        def f(self):
+            raise ValueError()
+
+    a = Actor.remote()
+    num_exceptions = 0
+
+    def interceptor(e):
+        nonlocal num_exceptions
+        num_exceptions += 1
+
+    # Test we report unhandled exceptions.
+    ray._private.worker._unhandled_error_handler = interceptor
+    x1 = f.remote()
+    x2 = a.f.remote()
+    del x1
+    del x2
+    wait_for_condition(lambda: num_exceptions == 2)
+
+    # Test we don't report handled exceptions.
+    x1 = f.remote()
+    x2 = a.f.remote()
+    with pytest.raises(ray.exceptions.RayError) as err:  # noqa
+        ray.get([x1, x2])
+    del x1
+    del x2
+    time.sleep(1)
+    assert num_exceptions == 2, num_exceptions
+
+    # Test suppression with env var works.
     try:
-        ray.get(f.remote())
-    except Exception as e:
-        assert "This function failed." in str(e)
-        assert isinstance(e, CustomException)
-        assert isinstance(e, ray.exceptions.RayTaskError)
-        assert "RayTaskError(CustomException)" in repr(e)
-    else:
-        # ray.get should throw an exception.
-        assert False
+        os.environ["RAY_IGNORE_UNHANDLED_ERRORS"] = "1"
+        x1 = f.remote()
+        del x1
+        time.sleep(1)
+        assert num_exceptions == 2, num_exceptions
+    finally:
+        del os.environ["RAY_IGNORE_UNHANDLED_ERRORS"]
 
 
-def test_fail_importing_remote_function(ray_start_2_cpus):
-    # Create the contents of a temporary Python file.
-    temporary_python_file = """
-def temporary_helper_function():
-    return 1
-"""
+def test_publish_error_to_driver(ray_start_regular, error_pubsub):
+    address_info = ray_start_regular
 
-    f = tempfile.NamedTemporaryFile(suffix=".py")
-    f.write(temporary_python_file.encode("ascii"))
-    f.flush()
-    directory = os.path.dirname(f.name)
-    # Get the module name and strip ".py" from the end.
-    module_name = os.path.basename(f.name)[:-3]
-    sys.path.append(directory)
-    module = __import__(module_name)
+    error_message = "Test error message"
+    ray._private.utils.publish_error_to_driver(
+        ray_constants.DASHBOARD_AGENT_DIED_ERROR,
+        error_message,
+        gcs_client=ray._raylet.GcsClient(address=address_info["gcs_address"]),
+    )
+    errors = get_error_message(
+        error_pubsub, 1, ray_constants.DASHBOARD_AGENT_DIED_ERROR
+    )
+    assert errors[0]["type"] == ray_constants.DASHBOARD_AGENT_DIED_ERROR
+    assert errors[0]["error_message"] == error_message
 
-    # Define a function that closes over this temporary module. This should
-    # fail when it is unpickled.
+
+def test_get_throws_quickly_when_found_exception(ray_start_regular):
+    # We use an actor instead of functions here. If we use functions, it's
+    # very likely that two normal tasks are submitted before the first worker
+    # is registered to Raylet. Since `maximum_startup_concurrency` is 1,
+    # the worker pool will wait for the registration of the first worker
+    # and skip starting new workers. The result is, the two tasks will be
+    # executed sequentially, which breaks an assumption of this test case -
+    # the two tasks run in parallel.
     @ray.remote
-    def g():
-        try:
-            module.temporary_python_file()
-        except Exception:
-            # This test is not concerned with the error from running this
-            # function. Only from unpickling the remote function.
-            pass
+    class Actor(object):
+        def bad_func1(self):
+            raise Exception("Test function intentionally failed.")
 
-    # Invoke the function so that the definition is exported.
-    g.remote()
+        def bad_func2(self):
+            os._exit(0)
 
-    wait_for_errors(ray_constants.REGISTER_REMOTE_FUNCTION_PUSH_ERROR, 2)
-    errors = relevant_errors(ray_constants.REGISTER_REMOTE_FUNCTION_PUSH_ERROR)
-    assert len(errors) >= 2, errors
-    assert "No module named" in errors[0]["message"]
-    assert "No module named" in errors[1]["message"]
+        def slow_func(self, signal):
+            ray.get(signal.wait.remote())
 
-    # Check that if we try to call the function it throws an exception and
-    # does not hang.
-    for _ in range(10):
-        with pytest.raises(Exception):
-            ray.get(g.remote())
+    def expect_exception(objects, exception):
+        with pytest.raises(ray.exceptions.RayError) as err:
+            ray.get(objects)
+        assert issubclass(err.type, exception)
 
-    f.close()
+    signal1 = SignalActor.remote()
+    actor = Actor.options(max_concurrency=2).remote()
+    expect_exception(
+        [actor.bad_func1.remote(), actor.slow_func.remote(signal1)],
+        ray.exceptions.RayTaskError,
+    )
+    ray.get(signal1.send.remote())
 
-    # Clean up the junk we added to sys.path.
-    sys.path.pop(-1)
-
-
-def test_failed_function_to_run(ray_start_2_cpus):
-    def f(worker):
-        if ray.worker.global_worker.mode == ray.WORKER_MODE:
-            raise Exception("Function to run failed.")
-
-    ray.worker.global_worker.run_function_on_all_workers(f)
-    wait_for_errors(ray_constants.FUNCTION_TO_RUN_PUSH_ERROR, 2)
-    # Check that the error message is in the task info.
-    errors = relevant_errors(ray_constants.FUNCTION_TO_RUN_PUSH_ERROR)
-    assert len(errors) == 2
-    assert "Function to run failed." in errors[0]["message"]
-    assert "Function to run failed." in errors[1]["message"]
+    signal2 = SignalActor.remote()
+    actor = Actor.options(max_concurrency=2).remote()
+    expect_exception(
+        [actor.bad_func2.remote(), actor.slow_func.remote(signal2)],
+        ray.exceptions.RayActorError,
+    )
+    ray.get(signal2.send.remote())
 
 
-def test_fail_importing_actor(ray_start_regular):
-    # Create the contents of a temporary Python file.
-    temporary_python_file = """
-def temporary_helper_function():
-    return 1
-"""
-
-    f = tempfile.NamedTemporaryFile(suffix=".py")
-    f.write(temporary_python_file.encode("ascii"))
-    f.flush()
-    directory = os.path.dirname(f.name)
-    # Get the module name and strip ".py" from the end.
-    module_name = os.path.basename(f.name)[:-3]
-    sys.path.append(directory)
-    module = __import__(module_name)
-
-    # Define an actor that closes over this temporary module. This should
-    # fail when it is unpickled.
-    @ray.remote
-    class Foo(object):
-        def __init__(self):
-            self.x = module.temporary_python_file()
-
-        def get_val(self):
-            return 1
-
-    # There should be no errors yet.
-    assert len(ray.errors()) == 0
-
-    # Create an actor.
-    foo = Foo.remote()
-
-    # Wait for the error to arrive.
-    wait_for_errors(ray_constants.REGISTER_ACTOR_PUSH_ERROR, 1)
-    errors = relevant_errors(ray_constants.REGISTER_ACTOR_PUSH_ERROR)
-    assert "No module named" in errors[0]["message"]
-
-    # Wait for the error from when the __init__ tries to run.
-    wait_for_errors(ray_constants.TASK_PUSH_ERROR, 1)
-    errors = relevant_errors(ray_constants.TASK_PUSH_ERROR)
-    assert ("failed to be imported, and so cannot execute this method" in
-            errors[0]["message"])
-
-    # Check that if we try to get the function it throws an exception and
-    # does not hang.
-    with pytest.raises(Exception):
-        ray.get(foo.get_val.remote())
-
-    # Wait for the error from when the call to get_val.
-    wait_for_errors(ray_constants.TASK_PUSH_ERROR, 2)
-    errors = relevant_errors(ray_constants.TASK_PUSH_ERROR)
-    assert ("failed to be imported, and so cannot execute this method" in
-            errors[1]["message"])
-
-    f.close()
-
-    # Clean up the junk we added to sys.path.
-    sys.path.pop(-1)
-
-
-def test_failed_actor_init(ray_start_regular):
+def test_failed_actor_init(ray_start_regular, error_pubsub):
     error_message1 = "actor constructor failed"
     error_message2 = "actor method failed"
 
     @ray.remote
-    class FailedActor(object):
+    class FailedActor:
         def __init__(self):
             raise Exception(error_message1)
 
@@ -221,44 +136,15 @@ def test_failed_actor_init(ray_start_regular):
 
     a = FailedActor.remote()
 
-    # Make sure that we get errors from a failed constructor.
-    wait_for_errors(ray_constants.TASK_PUSH_ERROR, 1)
-    errors = relevant_errors(ray_constants.TASK_PUSH_ERROR)
-    assert len(errors) == 1
-    assert error_message1 in errors[0]["message"]
-
-    # Make sure that we get errors from a failed method.
-    a.fail_method.remote()
-    wait_for_errors(ray_constants.TASK_PUSH_ERROR, 2)
-    errors = relevant_errors(ray_constants.TASK_PUSH_ERROR)
-    assert len(errors) == 2
-    assert error_message1 in errors[1]["message"]
-
-
-def test_failed_actor_method(ray_start_regular):
-    error_message2 = "actor method failed"
-
-    @ray.remote
-    class FailedActor(object):
-        def __init__(self):
-            pass
-
-        def fail_method(self):
-            raise Exception(error_message2)
-
-    a = FailedActor.remote()
-
-    # Make sure that we get errors from a failed method.
-    a.fail_method.remote()
-    wait_for_errors(ray_constants.TASK_PUSH_ERROR, 1)
-    errors = relevant_errors(ray_constants.TASK_PUSH_ERROR)
-    assert len(errors) == 1
-    assert error_message2 in errors[0]["message"]
+    # Incoming methods will get the exception in creation task
+    with pytest.raises(ray.exceptions.RayActorError) as e:
+        ray.get(a.fail_method.remote())
+    assert error_message1 in str(e.value)
 
 
 def test_incorrect_method_calls(ray_start_regular):
     @ray.remote
-    class Actor(object):
+    class Actor:
         def __init__(self, missing_variable_name):
             pass
 
@@ -292,39 +178,46 @@ def test_incorrect_method_calls(ray_start_regular):
         a.nonexistent_method.remote()
 
 
-def test_worker_raising_exception(ray_start_regular):
-    @ray.remote
+def test_worker_raising_exception(ray_start_regular, error_pubsub):
+    p = error_pubsub
+
+    @ray.remote(max_calls=2)
     def f():
         # This is the only reasonable variable we can set here that makes the
         # execute_task function fail after the task got executed.
-        ray.experimental.signal.reset = None
+        worker = ray._private.worker.global_worker
+        worker.function_actor_manager.increase_task_counter = None
 
     # Running this task should cause the worker to raise an exception after
     # the task has successfully completed.
     f.remote()
+    errors = get_error_message(p, 1, ray_constants.WORKER_CRASH_PUSH_ERROR)
+    assert len(errors) == 1
+    assert errors[0]["type"] == ray_constants.WORKER_CRASH_PUSH_ERROR
 
-    wait_for_errors(ray_constants.WORKER_CRASH_PUSH_ERROR, 1)
 
-
-def test_worker_dying(ray_start_regular):
+def test_worker_dying(ray_start_regular, error_pubsub):
+    p = error_pubsub
     # Define a remote function that will kill the worker that runs it.
+
     @ray.remote(max_retries=0)
     def f():
         eval("exit()")
 
-    with pytest.raises(ray.exceptions.RayWorkerError):
+    with pytest.raises(ray.exceptions.WorkerCrashedError):
         ray.get(f.remote())
 
-    wait_for_errors(ray_constants.WORKER_DIED_PUSH_ERROR, 1)
-
-    errors = relevant_errors(ray_constants.WORKER_DIED_PUSH_ERROR)
+    errors = get_error_message(p, 1, ray_constants.WORKER_DIED_PUSH_ERROR)
     assert len(errors) == 1
-    assert "died or was killed while executing" in errors[0]["message"]
+    assert errors[0]["type"] == ray_constants.WORKER_DIED_PUSH_ERROR
+    assert "died or was killed while executing" in errors[0]["error_message"]
 
 
-def test_actor_worker_dying(ray_start_regular):
+def test_actor_worker_dying(ray_start_regular, error_pubsub):
+    p = error_pubsub
+
     @ray.remote
-    class Actor(object):
+    class Actor:
         def kill(self):
             eval("exit()")
 
@@ -333,17 +226,21 @@ def test_actor_worker_dying(ray_start_regular):
         pass
 
     a = Actor.remote()
-    [obj], _ = ray.wait([a.kill.remote()], timeout=5.0)
+    [obj], _ = ray.wait([a.kill.remote()], timeout=5)
     with pytest.raises(ray.exceptions.RayActorError):
         ray.get(obj)
     with pytest.raises(ray.exceptions.RayTaskError):
         ray.get(consume.remote(obj))
-    wait_for_errors(ray_constants.WORKER_DIED_PUSH_ERROR, 1)
+    errors = get_error_message(p, 1, ray_constants.WORKER_DIED_PUSH_ERROR)
+    assert len(errors) == 1
+    assert errors[0]["type"] == ray_constants.WORKER_DIED_PUSH_ERROR
 
 
-def test_actor_worker_dying_future_tasks(ray_start_regular):
-    @ray.remote(max_reconstructions=0)
-    class Actor(object):
+def test_actor_worker_dying_future_tasks(ray_start_regular, error_pubsub):
+    p = error_pubsub
+
+    @ray.remote(max_restarts=0)
+    class Actor:
         def getpid(self):
             return os.getpid()
 
@@ -360,12 +257,14 @@ def test_actor_worker_dying_future_tasks(ray_start_regular):
         with pytest.raises(Exception):
             ray.get(obj)
 
-    wait_for_errors(ray_constants.WORKER_DIED_PUSH_ERROR, 1)
+    errors = get_error_message(p, 1, ray_constants.WORKER_DIED_PUSH_ERROR)
+    assert len(errors) == 1
+    assert errors[0]["type"] == ray_constants.WORKER_DIED_PUSH_ERROR
 
 
 def test_actor_worker_dying_nothing_in_progress(ray_start_regular):
-    @ray.remote(max_reconstructions=0)
-    class Actor(object):
+    @ray.remote(max_restarts=0)
+    class Actor:
         def getpid(self):
             return os.getpid()
 
@@ -378,24 +277,110 @@ def test_actor_worker_dying_nothing_in_progress(ray_start_regular):
         ray.get(task2)
 
 
-def test_actor_scope_or_intentionally_killed_message(ray_start_regular):
+@pytest.mark.skipif(sys.platform == "win32", reason="Too flaky on windows")
+def test_actor_scope_or_intentionally_killed_message(ray_start_regular, error_pubsub):
+    p = error_pubsub
+
     @ray.remote
-    class Actor(object):
-        pass
+    class Actor:
+        def __init__(self):
+            # This log is added to debug a flaky test issue.
+            print(os.getpid())
+
+        def ping(self):
+            pass
 
     a = Actor.remote()
+    ray.get(a.ping.remote())
+    del a
+
     a = Actor.remote()
-    a.__ray_terminate__.remote()
-    time.sleep(1)
-    assert len(
-        ray.errors()) == 0, ("Should not have propogated an error - {}".format(
-            ray.errors()))
+    ray.get(a.ping.remote())
+    with pytest.raises(ray.exceptions.ActorDiedError):
+        ray.get(a.__ray_terminate__.remote())
+
+    errors = get_error_message(p, 1, timeout=1)
+    assert len(errors) == 0, "Should not have propogated an error - {}".format(errors)
+
+
+def test_mixed_hanging_and_exception_should_not_hang(ray_start_regular):
+    @ray.remote
+    class Actor:
+        def __init__(self, _id):
+            self._id = _id
+
+        def execute(self, fn) -> None:
+            return fn(self._id)
+
+    def print_and_raise_error(i):
+        print(i)
+        raise ValueError
+
+    def print_and_sleep_forever(i):
+        print(i)
+        while True:
+            time.sleep(3600)
+
+    actors = [Actor.remote(i) for i in range(10)]
+    refs = [actor.execute.remote(print_and_raise_error) for actor in actors[:2]]
+
+    with pytest.raises(ValueError):
+        ray.get(refs)
+
+    refs.extend([actor.execute.remote(print_and_sleep_forever) for actor in actors[2:]])
+
+    with pytest.raises(ValueError):
+        ray.get(refs)
+
+
+def test_mixed_hanging_and_died_actor_should_not_hang(ray_start_regular):
+    @ray.remote
+    class Actor:
+        def __init__(self, _id):
+            self._id = _id
+
+        def execute(self, fn) -> None:
+            return fn(self._id)
+
+        def exit(self):
+            ray.actor.exit_actor()
+
+    def print_and_sleep_forever(i):
+        print(i)
+        while True:
+            time.sleep(3600)
+
+    actors = [Actor.remote(i) for i in range(10)]
+    ray.get([actor.__ray_ready__.remote() for actor in actors])
+    error_refs = [actor.exit.remote() for actor in actors[:2]]
+
+    with pytest.raises(ActorDiedError):
+        ray.get(error_refs)
+
+    with pytest.raises(ActorDiedError):
+        ray.get([actor.execute.remote(print_and_sleep_forever) for actor in actors])
+
+
+def test_exception_chain(ray_start_regular):
+    @ray.remote
+    def bar():
+        return 1 / 0
+
+    @ray.remote
+    def foo():
+        return ray.get(bar.remote())
+
+    r = foo.remote()
+    try:
+        ray.get(r)
+    except ZeroDivisionError as ex:
+        assert isinstance(ex, RayTaskError)
 
 
 @pytest.mark.skip("This test does not work yet.")
-@pytest.mark.parametrize(
-    "ray_start_object_store_memory", [10**6], indirect=True)
-def test_put_error1(ray_start_object_store_memory):
+@pytest.mark.parametrize("ray_start_object_store_memory", [10**6], indirect=True)
+def test_put_error1(ray_start_object_store_memory, error_pubsub):
+    p = error_pubsub
     num_objects = 3
     object_size = 4 * 10**5
 
@@ -413,8 +398,7 @@ def test_put_error1(ray_start_object_store_memory):
         # on the one before it. The result of the first task should get
         # evicted.
         args = []
-        arg = single_dependency.remote(0, np.zeros(
-            object_size, dtype=np.uint8))
+        arg = single_dependency.remote(0, np.zeros(object_size, dtype=np.uint8))
         for i in range(num_objects):
             arg = single_dependency.remote(i, arg)
             args.append(arg)
@@ -433,12 +417,13 @@ def test_put_error1(ray_start_object_store_memory):
     put_arg_task.remote()
 
     # Make sure we receive the correct error message.
-    wait_for_errors(ray_constants.PUT_RECONSTRUCTION_PUSH_ERROR, 1)
+    errors = get_error_message(p, 1, ray_constants.PUT_RECONSTRUCTION_PUSH_ERROR)
+    assert len(errors) == 1
+    assert errors[0]["type"] == ray_constants.PUT_RECONSTRUCTION_PUSH_ERROR
 
 
 @pytest.mark.skip("This test does not work yet.")
-@pytest.mark.parametrize(
-    "ray_start_object_store_memory", [10**6], indirect=True)
+@pytest.mark.parametrize("ray_start_object_store_memory", [10**6], indirect=True)
 def test_put_error2(ray_start_object_store_memory):
     # This is the same as the previous test, but it calls ray.put directly.
     num_objects = 3
@@ -477,530 +462,257 @@ def test_put_error2(ray_start_object_store_memory):
     put_task.remote()
 
     # Make sure we receive the correct error message.
-    wait_for_errors(ray_constants.PUT_RECONSTRUCTION_PUSH_ERROR, 1)
+    # get_error_message(ray_constants.PUT_RECONSTRUCTION_PUSH_ERROR, 1)
 
 
-def test_version_mismatch(shutdown_only):
+def test_version_mismatch(ray_start_cluster):
     ray_version = ray.__version__
-    ray.__version__ = "fake ray version"
+    try:
+        cluster = ray_start_cluster
+        cluster.add_node(num_cpus=1)
 
-    ray.init(num_cpus=1)
+        # Test the driver.
+        ray.__version__ = "fake ray version"
+        with pytest.raises(RuntimeError):
+            ray.init(address="auto")
 
-    wait_for_errors(ray_constants.VERSION_MISMATCH_PUSH_ERROR, 1)
-
-    # Reset the version.
-    ray.__version__ = ray_version
-
-
-def test_warning_monitor_died(ray_start_2_cpus):
-    @ray.remote
-    def f():
-        pass
-
-    # Wait for the monitor process to start.
-    ray.get(f.remote())
-    time.sleep(1)
-
-    # Cause the monitor to raise an exception by pushing a malformed message to
-    # Redis. This will probably kill the raylet and the raylet_monitor in
-    # addition to the monitor.
-    fake_id = 20 * b"\x00"
-    malformed_message = "asdf"
-    redis_client = ray.worker.global_worker.redis_client
-    redis_client.execute_command(
-        "RAY.TABLE_ADD", ray.gcs_utils.TablePrefix.Value("HEARTBEAT_BATCH"),
-        ray.gcs_utils.TablePubsub.Value("HEARTBEAT_BATCH_PUBSUB"), fake_id,
-        malformed_message)
-
-    wait_for_errors(ray_constants.MONITOR_DIED_ERROR, 1)
+    finally:
+        # Reset the version.
+        ray.__version__ = ray_version
 
 
-def test_export_large_objects(ray_start_regular):
-    import ray.ray_constants as ray_constants
-
-    large_object = np.zeros(2 * ray_constants.PICKLE_OBJECT_WARNING_SIZE)
+def test_export_large_objects(ray_start_regular, error_pubsub):
+    p = error_pubsub
+    large_object = np.zeros(
+        2 * ray_constants.FUNCTION_SIZE_WARN_THRESHOLD, dtype=np.uint8
+    )
 
     @ray.remote
     def f():
-        large_object
+        _ = large_object
 
     # Invoke the function so that the definition is exported.
     f.remote()
 
     # Make sure that a warning is generated.
-    wait_for_errors(ray_constants.PICKLING_LARGE_OBJECT_PUSH_ERROR, 1)
+    errors = get_error_message(p, 1, ray_constants.PICKLING_LARGE_OBJECT_PUSH_ERROR)
+    assert len(errors) == 1
+    assert errors[0]["type"] == ray_constants.PICKLING_LARGE_OBJECT_PUSH_ERROR
 
     @ray.remote
-    class Foo(object):
+    class Foo:
         def __init__(self):
-            large_object
+            _ = large_object
 
     Foo.remote()
 
     # Make sure that a warning is generated.
-    wait_for_errors(ray_constants.PICKLING_LARGE_OBJECT_PUSH_ERROR, 2)
+    errors = get_error_message(p, 1, ray_constants.PICKLING_LARGE_OBJECT_PUSH_ERROR)
+    assert len(errors) == 1
+    assert errors[0]["type"] == ray_constants.PICKLING_LARGE_OBJECT_PUSH_ERROR
 
 
-@pytest.mark.skipif(RAY_FORCE_DIRECT, reason="TODO detect resource deadlock")
-def test_warning_for_resource_deadlock(shutdown_only):
-    # Check that we get warning messages for infeasible tasks.
+def test_warning_many_actor_tasks_queued(shutdown_only):
     ray.init(num_cpus=1)
+    p = init_error_pubsub()
 
     @ray.remote(num_cpus=1)
-    class Foo(object):
+    class Foo:
         def f(self):
-            return 0
-
-    @ray.remote
-    def f():
-        # Creating both actors is not possible.
-        actors = [Foo.remote() for _ in range(2)]
-        for a in actors:
-            ray.get(a.f.remote())
-
-    # Run in a task to check we handle the blocked task case correctly
-    f.remote()
-    wait_for_errors(ray_constants.RESOURCE_DEADLOCK_ERROR, 1, timeout=30)
-
-
-def test_warning_for_infeasible_tasks(ray_start_regular):
-    # Check that we get warning messages for infeasible tasks.
-
-    @ray.remote(num_gpus=1)
-    def f():
-        pass
-
-    @ray.remote(resources={"Custom": 1})
-    class Foo(object):
-        pass
-
-    # This task is infeasible.
-    f.remote()
-    wait_for_errors(ray_constants.INFEASIBLE_TASK_ERROR, 1)
-
-    # This actor placement task is infeasible.
-    Foo.remote()
-    wait_for_errors(ray_constants.INFEASIBLE_TASK_ERROR, 2)
-
-
-def test_warning_for_infeasible_zero_cpu_actor(shutdown_only):
-    # Check that we cannot place an actor on a 0 CPU machine and that we get an
-    # infeasibility warning (even though the actor creation task itself
-    # requires no CPUs).
-
-    ray.init(num_cpus=0)
-
-    @ray.remote
-    class Foo(object):
-        pass
-
-    # The actor creation should be infeasible.
-    Foo.remote()
-    wait_for_errors(ray_constants.INFEASIBLE_TASK_ERROR, 1)
-
-
-def test_warning_for_too_many_actors(shutdown_only):
-    # Check that if we run a workload which requires too many workers to be
-    # started that we will receive a warning.
-    num_cpus = 2
-    ray.init(num_cpus=num_cpus)
-
-    @ray.remote
-    class Foo(object):
-        def __init__(self):
             time.sleep(1000)
 
-    [Foo.remote() for _ in range(num_cpus * 3)]
-    wait_for_errors(ray_constants.WORKER_POOL_LARGE_ERROR, 1)
-    [Foo.remote() for _ in range(num_cpus)]
-    wait_for_errors(ray_constants.WORKER_POOL_LARGE_ERROR, 2)
+    a = Foo.remote()
+    [a.f.remote() for _ in range(20000)]
+    errors = get_error_message(p, 2, ray_constants.EXCESS_QUEUEING_WARNING)
+    msgs = [e["error_message"] for e in errors]
+    assert "Warning: More than 5000 tasks are pending submission to actor" in msgs[0]
+    assert "Warning: More than 10000 tasks are pending submission to actor" in msgs[1]
 
 
-def test_warning_for_too_many_nested_tasks(shutdown_only):
-    # Check that if we run a workload which requires too many workers to be
-    # started that we will receive a warning.
-    num_cpus = 2
-    ray.init(num_cpus=num_cpus)
-
-    @ray.remote
-    def f():
-        time.sleep(1000)
-        return 1
-
-    @ray.remote
-    def h():
-        time.sleep(1)
-        ray.get(f.remote())
-
-    @ray.remote
-    def g():
-        # Sleep so that the f tasks all get submitted to the scheduler after
-        # the g tasks.
-        time.sleep(1)
-        ray.get(h.remote())
-
-    [g.remote() for _ in range(num_cpus * 4)]
-    wait_for_errors(ray_constants.WORKER_POOL_LARGE_ERROR, 1)
-
-
-@pytest.mark.skipif(
-    sys.version_info < (3, 0), reason="This test requires Python 3.")
-def test_warning_for_many_duplicate_remote_functions_and_actors(shutdown_only):
+def test_no_warning_many_actor_tasks_queued_when_sequential(shutdown_only):
     ray.init(num_cpus=1)
+    p = init_error_pubsub()
 
-    @ray.remote
-    def create_remote_function():
-        @ray.remote
-        def g():
+    @ray.remote(num_cpus=1)
+    class Foo:
+        def f(self):
             return 1
 
-        return ray.get(g.remote())
-
-    for _ in range(ray_constants.DUPLICATE_REMOTE_FUNCTION_THRESHOLD - 1):
-        ray.get(create_remote_function.remote())
-
-    import io
-    log_capture_string = io.StringIO()
-    ch = logging.StreamHandler(log_capture_string)
-
-    # TODO(rkn): It's terrible to have to rely on this implementation detail,
-    # the fact that the warning comes from ray.import_thread.logger. However,
-    # I didn't find a good way to capture the output for all loggers
-    # simultaneously.
-    ray.import_thread.logger.addHandler(ch)
-
-    ray.get(create_remote_function.remote())
-
-    start_time = time.time()
-    while time.time() < start_time + 10:
-        log_contents = log_capture_string.getvalue()
-        if len(log_contents) > 0:
-            break
-
-    ray.import_thread.logger.removeHandler(ch)
-
-    assert "remote function" in log_contents
-    assert "has been exported {} times.".format(
-        ray_constants.DUPLICATE_REMOTE_FUNCTION_THRESHOLD) in log_contents
-
-    # Now test the same thing but for actors.
-
-    @ray.remote
-    def create_actor_class():
-        # Require a GPU so that the actor is never actually created and we
-        # don't spawn an unreasonable number of processes.
-        @ray.remote(num_gpus=1)
-        class Foo(object):
-            pass
-
-        Foo.remote()
-
-    for _ in range(ray_constants.DUPLICATE_REMOTE_FUNCTION_THRESHOLD - 1):
-        ray.get(create_actor_class.remote())
-
-    log_capture_string = io.StringIO()
-    ch = logging.StreamHandler(log_capture_string)
-
-    # TODO(rkn): As mentioned above, it's terrible to have to rely on this
-    # implementation detail.
-    ray.import_thread.logger.addHandler(ch)
-
-    ray.get(create_actor_class.remote())
-
-    start_time = time.time()
-    while time.time() < start_time + 10:
-        log_contents = log_capture_string.getvalue()
-        if len(log_contents) > 0:
-            break
-
-    ray.import_thread.logger.removeHandler(ch)
-
-    assert "actor" in log_contents
-    assert "has been exported {} times.".format(
-        ray_constants.DUPLICATE_REMOTE_FUNCTION_THRESHOLD) in log_contents
-
-
-def test_redis_module_failure(ray_start_regular):
-    address_info = ray_start_regular
-    address = address_info["redis_address"]
-    address = address.split(":")
-    assert len(address) == 2
-
-    def run_failure_test(expecting_message, *command):
-        with pytest.raises(
-                Exception, match=".*{}.*".format(expecting_message)):
-            client = redis.StrictRedis(
-                host=address[0],
-                port=int(address[1]),
-                password=ray_constants.REDIS_DEFAULT_PASSWORD)
-            client.execute_command(*command)
-
-    def run_one_command(*command):
-        client = redis.StrictRedis(
-            host=address[0],
-            port=int(address[1]),
-            password=ray_constants.REDIS_DEFAULT_PASSWORD)
-        client.execute_command(*command)
-
-    run_failure_test("wrong number of arguments", "RAY.TABLE_ADD", 13)
-    run_failure_test("Prefix must be in the TablePrefix range",
-                     "RAY.TABLE_ADD", 100000, 1, 1, 1)
-    run_failure_test("Prefix must be in the TablePrefix range",
-                     "RAY.TABLE_REQUEST_NOTIFICATIONS", 100000, 1, 1, 1)
-    run_failure_test("Prefix must be a valid TablePrefix integer",
-                     "RAY.TABLE_ADD", b"a", 1, 1, 1)
-    run_failure_test("Pubsub channel must be in the TablePubsub range",
-                     "RAY.TABLE_ADD", 1, 10000, 1, 1)
-    run_failure_test("Pubsub channel must be a valid integer", "RAY.TABLE_ADD",
-                     1, b"a", 1, 1)
-    # Change the key from 1 to 2, since the previous command should have
-    # succeeded at writing the key, but not publishing it.
-    run_failure_test("Index is less than 0.", "RAY.TABLE_APPEND", 1, 1, 2, 1,
-                     -1)
-    run_failure_test("Index is not a number.", "RAY.TABLE_APPEND", 1, 1, 2, 1,
-                     b"a")
-    run_one_command("RAY.TABLE_APPEND", 1, 1, 2, 1)
-    # It's okay to add duplicate entries.
-    run_one_command("RAY.TABLE_APPEND", 1, 1, 2, 1)
-    run_one_command("RAY.TABLE_APPEND", 1, 1, 2, 1, 0)
-    run_one_command("RAY.TABLE_APPEND", 1, 1, 2, 1, 1)
-    run_one_command("RAY.SET_ADD", 1, 1, 3, 1)
-    # It's okey to add duplicate entries.
-    run_one_command("RAY.SET_ADD", 1, 1, 3, 1)
-    run_one_command("RAY.SET_REMOVE", 1, 1, 3, 1)
-    # It's okey to remove duplicate entries.
-    run_one_command("RAY.SET_REMOVE", 1, 1, 3, 1)
-
-
-# Note that this test will take at least 10 seconds because it must wait for
-# the monitor to detect enough missed heartbeats.
-def test_warning_for_dead_node(ray_start_cluster_2_nodes):
-    cluster = ray_start_cluster_2_nodes
-    cluster.wait_for_nodes()
-
-    node_ids = {item["NodeID"] for item in ray.nodes()}
-
-    # Try to make sure that the monitor has received at least one heartbeat
-    # from the node.
-    time.sleep(0.5)
-
-    # Kill both raylets.
-    cluster.list_all_nodes()[1].kill_raylet()
-    cluster.list_all_nodes()[0].kill_raylet()
-
-    # Check that we get warning messages for both raylets.
-    wait_for_errors(ray_constants.REMOVED_NODE_ERROR, 2, timeout=40)
-
-    # Extract the client IDs from the error messages. This will need to be
-    # changed if the error message changes.
-    warning_node_ids = {
-        item["message"].split(" ")[5]
-        for item in relevant_errors(ray_constants.REMOVED_NODE_ERROR)
-    }
-
-    assert node_ids == warning_node_ids
-
-
-def test_raylet_crash_when_get(ray_start_regular):
-    def sleep_to_kill_raylet():
-        # Don't kill raylet before default workers get connected.
-        time.sleep(2)
-        ray.worker._global_node.kill_raylet()
-
-    thread = threading.Thread(target=sleep_to_kill_raylet)
-    thread.start()
-    with pytest.raises(ray.exceptions.UnreconstructableError):
-        ray.get(ray.ObjectID.from_random())
-    thread.join()
-
-
-def test_connect_with_disconnected_node(shutdown_only):
-    config = json.dumps({
-        "num_heartbeats_timeout": 50,
-        "raylet_heartbeat_timeout_milliseconds": 10,
-    })
-    cluster = Cluster()
-    cluster.add_node(num_cpus=0, _internal_config=config)
-    ray.init(address=cluster.address)
-    info = relevant_errors(ray_constants.REMOVED_NODE_ERROR)
-    assert len(info) == 0
-    # This node is killed by SIGKILL, ray_monitor will mark it to dead.
-    dead_node = cluster.add_node(num_cpus=0, _internal_config=config)
-    cluster.remove_node(dead_node, allow_graceful=False)
-    wait_for_errors(ray_constants.REMOVED_NODE_ERROR, 1, timeout=2)
-    # This node is killed by SIGKILL, ray_monitor will mark it to dead.
-    dead_node = cluster.add_node(num_cpus=0, _internal_config=config)
-    cluster.remove_node(dead_node, allow_graceful=False)
-    wait_for_errors(ray_constants.REMOVED_NODE_ERROR, 2, timeout=2)
-    # This node is killed by SIGTERM, ray_monitor will not mark it again.
-    removing_node = cluster.add_node(num_cpus=0, _internal_config=config)
-    cluster.remove_node(removing_node, allow_graceful=True)
-    with pytest.raises(RayTestTimeoutException):
-        wait_for_errors(ray_constants.REMOVED_NODE_ERROR, 3, timeout=2)
-    # There is no connection error to a dead node.
-    info = relevant_errors(ray_constants.RAYLET_CONNECTION_ERROR)
-    assert len(info) == 0
+    a = Foo.remote()
+    for _ in range(10000):
+        assert ray.get(a.f.remote()) == 1
+    errors = get_error_message(p, 1, ray_constants.EXCESS_QUEUEING_WARNING, timeout=1)
+    assert len(errors) == 0
 
 
 @pytest.mark.parametrize(
-    "ray_start_cluster_head", [{
-        "num_cpus": 5,
-        "object_store_memory": 10**8
-    }],
-    indirect=True)
-@pytest.mark.parametrize("num_actors", [1, 2, 5])
-def test_parallel_actor_fill_plasma_retry(ray_start_cluster_head, num_actors):
-    @ray.remote
-    class LargeMemoryActor(object):
-        def some_expensive_task(self):
-            return np.zeros(10**8 // 2, dtype=np.uint8)
+    "ray_start_cluster_head",
+    [
+        {
+            "num_cpus": 0,
+            "_system_config": {
+                "raylet_death_check_interval_milliseconds": 10 * 1000,
+                "health_check_initial_delay_ms": 0,
+                "health_check_failure_threshold": 10,
+                "health_check_period_ms": 100,
+                "timeout_ms_task_wait_for_death_info": 100,
+            },
+            "include_dashboard": True,  # for list_actors API
+        },
+    ],
+    indirect=True,
+)
+def test_actor_failover_with_bad_network(ray_start_cluster_head):
+    # The test case is to cover the scenario that when an actor FO happens,
+    # the caller receives the actor ALIVE notification and connects to the new
+    # actor instance while there are still some tasks sent to the previous
+    # actor instance haven't returned.
+    #
+    # It's not easy to reproduce this scenario, so we set
+    # `raylet_death_check_interval_milliseconds` to a large value and add a
+    # never-return function for the actor to keep the RPC connection alive
+    # while killing the node to trigger actor failover. Later we send SIGKILL
+    # to kill the previous actor process to let the task fail.
+    #
+    # The expected behavior is that after the actor is alive again and the
+    # previous RPC connection is broken, tasks sent via the previous RPC
+    # connection should fail but tasks sent via the new RPC connection should
+    # succeed.
 
-    actors = [LargeMemoryActor.remote() for _ in range(num_actors)]
-    for _ in range(10):
-        pending = [a.some_expensive_task.remote() for a in actors]
-        while pending:
-            [done], pending = ray.wait(pending, num_returns=1)
+    cluster = ray_start_cluster_head
+    node = cluster.add_node(num_cpus=1)
+
+    @ray.remote(max_restarts=1)
+    class Actor:
+        def getpid(self):
+            return os.getpid()
+
+        def never_return(self):
+            while True:
+                time.sleep(1)
+            return 0
+
+    # The actor should be placed on the non-head node.
+    actor = Actor.remote()
+    pid = ray.get(actor.getpid.remote())
+
+    # Submit a never-return task (task 1) to the actor. The return
+    # object should be unready.
+    obj1 = actor.never_return.remote()
+    with pytest.raises(GetTimeoutError):
+        ray.get(obj1, timeout=1)
+
+    # Kill the non-head node and start a new one. Now GCS should trigger actor
+    # FO. Since we changed the interval of worker checking death of Raylet,
+    # the actor process won't quit in a short time.
+    cluster.remove_node(node, allow_graceful=False)
+    cluster.add_node(num_cpus=1)
+
+    # The removed node will be marked as dead by GCS after 1 second and task 1
+    # will return with failure after that.
+    with pytest.raises(RayActorError):
+        ray.get(obj1, timeout=2)
+
+    # Wait for the actor to be alive again in a new worker process.
+    def check_actor_restart():
+        actors = ray.util.state.list_actors(
+            detail=True
+        )  # detail is needed for num_restarts to populate
+        assert len(actors) == 1
+        return actors[0].state == "ALIVE" and actors[0].num_restarts == 1
+
+    wait_for_condition(check_actor_restart)
+
+    # Kill the previous actor process.
+    os.kill(pid, signal.SIGKILL)
+
+    # Submit another task (task 2) to the actor.
+    obj2 = actor.getpid.remote()
+
+    # We should be able to get the return value of task 2 without any issue
+    ray.get(obj2)
 
 
-@pytest.mark.parametrize(
-    "ray_start_cluster_head", [{
-        "num_cpus": 2,
-        "object_store_memory": 10**8
-    }],
-    indirect=True)
-def test_fill_object_store_exception(ray_start_cluster_head):
-    @ray.remote
-    class LargeMemoryActor(object):
-        def some_expensive_task(self):
-            return np.zeros(10**8 + 2, dtype=np.uint8)
-
-        def test(self):
-            return 1
-
-    actor = LargeMemoryActor.remote()
-    with pytest.raises(ray.exceptions.RayTaskError):
-        ray.get(actor.some_expensive_task.remote())
-    # Make sure actor does not die
-    ray.get(actor.test.remote())
-
-    with pytest.raises(ray.exceptions.ObjectStoreFullError):
-        ray.put(np.zeros(10**8 + 2, dtype=np.uint8))
-
-
-@pytest.mark.skipif(
-    not RAY_FORCE_DIRECT,
-    reason="raylet path attempts reconstruction for evicted objects")
-@pytest.mark.parametrize(
-    "ray_start_cluster", [{
-        "num_nodes": 1,
-        "num_cpus": 2,
-    }, {
-        "num_nodes": 2,
-        "num_cpus": 1,
-    }],
-    indirect=True)
-def test_direct_call_eviction(ray_start_cluster):
-    @ray.remote
-    def large_object():
-        return np.zeros(10 * 1024 * 1024)
-
-    obj = large_object.remote()
-    assert (isinstance(ray.get(obj), np.ndarray))
-    # Evict the object.
-    ray.internal.free([obj])
-    while ray.worker.global_worker.core_worker.object_exists(obj):
-        time.sleep(1)
-    # ray.get throws an exception.
-    with pytest.raises(ray.exceptions.UnreconstructableError):
-        ray.get(obj)
-
-    @ray.remote
-    def dependent_task(x):
-        return
-
-    # If the object is passed by reference, the task throws an
-    # exception.
-    with pytest.raises(ray.exceptions.RayTaskError):
-        ray.get(dependent_task.remote(obj))
-
-
-@pytest.mark.skipif(
-    not RAY_FORCE_DIRECT,
-    reason="raylet path attempts reconstruction for evicted objects")
-@pytest.mark.parametrize(
-    "ray_start_cluster", [{
-        "num_nodes": 1,
-        "num_cpus": 2,
-    }, {
-        "num_nodes": 2,
-        "num_cpus": 1,
-    }],
-    indirect=True)
-def test_direct_call_serialized_id_eviction(ray_start_cluster):
-    @ray.remote
-    def large_object():
-        return np.zeros(10 * 1024 * 1024)
+# Previously when threading.Lock is in the exception, it causes
+# the serialization to fail. This test case is to cover that scenario.
+def test_unserializable_exception(ray_start_regular, propagate_logs):
+    class UnserializableException(Exception):
+        def __init__(self):
+            self.lock = threading.Lock()
 
     @ray.remote
-    def get(obj_ids):
-        print("get", obj_ids)
-        obj_id = obj_ids[0]
-        assert (isinstance(ray.get(obj_id), np.ndarray))
-        # Evict the object.
-        ray.internal.free(obj_ids)
-        while ray.worker.global_worker.core_worker.object_exists(obj_id):
-            time.sleep(1)
-        with pytest.raises(ray.exceptions.UnreconstructableError):
-            ray.get(obj_id)
-        print("get done", obj_ids)
+    def func():
+        raise UnserializableException
 
-    obj = large_object.remote()
-    ray.get(get.remote([obj]))
+    with pytest.raises(ray.exceptions.RayTaskError) as exc_info:
+        ray.get(func.remote())
+
+    assert isinstance(exc_info.value, ray.exceptions.RayTaskError)
+    assert isinstance(exc_info.value.cause, ray.exceptions.RayError)
+    assert "isn't serializable" in str(exc_info.value.cause)
 
 
-@pytest.mark.parametrize(
-    "ray_start_cluster", [{
-        "num_nodes": 2,
-        "num_cpus": 1,
-    }, {
-        "num_nodes": 1,
-        "num_cpus": 2,
-    }],
-    indirect=True)
-def test_serialized_id(ray_start_cluster):
-    @ray.remote
-    def small_object():
-        # Sleep a bit before creating the object to force a timeout
-        # at the getter.
-        time.sleep(1)
-        return 1
+def test_final_user_exception(ray_start_regular, propagate_logs, caplog):
+    class MyFinalException(Exception):
+        def __init_subclass__(cls, /, *args, **kwargs):
+            raise TypeError("Can't subclass special typing classes")
+
+    # This should error.
+    with pytest.raises(MyFinalException):
+        raise MyFinalException("MyFinalException from driver")
 
     @ray.remote
-    def dependent_task(x):
-        return x
+    def func():
+        # This should also error. Problem is, the user exception is final so we can't
+        # subclass it (raises exception if so). This means Ray cannot raise an exception
+        # that can be caught as both `RayTaskError` and the user exception. So we
+        # issue a warning and just raise it as `RayTaskError`. User needs to use
+        # `e.cause` to get the user exception.
+        raise MyFinalException("MyFinalException from task")
 
-    @ray.remote
-    def get(obj_ids, test_dependent_task):
-        print("get", obj_ids)
-        obj_id = obj_ids[0]
-        if test_dependent_task:
-            assert ray.get(dependent_task.remote(obj_id)) == 1
-        else:
-            assert ray.get(obj_id) == 1
+    with caplog.at_level(logging.WARNING, logger="ray.exceptions"):
+        with pytest.raises(ray.exceptions.RayTaskError) as exc_info:
+            ray.get(func.remote())
 
-    obj = small_object.remote()
-    ray.get(get.remote([obj], False))
+    assert (
+        "This exception is raised as RayTaskError only. You can use "
+        "`ray_task_error.cause` to access the user exception."
+    ) in caplog.text
+    assert isinstance(exc_info.value, ray.exceptions.RayTaskError)
+    assert isinstance(exc_info.value.cause, MyFinalException)
+    assert str(exc_info.value.cause) == "MyFinalException from task"
 
-    obj = small_object.remote()
-    ray.get(get.remote([obj], True))
+    caplog.clear()
 
-    obj = ray.put(1)
-    ray.get(get.remote([obj], False))
 
-    obj = ray.put(1)
-    ray.get(get.remote([obj], True))
+def test_raytaskerror_serialization(ray_start_regular):
+    """Test that RayTaskError with dual exception instances can be properly serialized."""
+    import ray.cloudpickle as pickle
+
+    class MyException(Exception):
+        def __init__(self, one, two):
+            self.one = one
+            self.two = two
+
+        def __reduce__(self):
+            return self.__class__, (self.one, self.two)
+
+    original_exception = MyException("test 1", "test 2")
+    ray_task_error = ray.exceptions.RayTaskError(
+        function_name="test_function",
+        traceback_str="test traceback",
+        cause=original_exception,
+    )
+
+    dual_exception = ray_task_error.make_dual_exception_instance()
+    pickled = pickle.dumps(dual_exception)
+    unpickled = pickle.loads(pickled)
+
+    assert isinstance(unpickled, ray.exceptions.RayTaskError)
+    assert isinstance(unpickled, MyException)
+    assert unpickled.one == "test 1"
+    assert unpickled.two == "test 2"
 
 
 if __name__ == "__main__":
-    import pytest
-    sys.exit(pytest.main(["-v", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

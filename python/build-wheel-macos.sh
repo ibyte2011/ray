@@ -6,86 +6,88 @@ set -e
 # Show explicitly which commands are currently running.
 set -x
 
-# Much of this is taken from https://github.com/matthew-brett/multibuild.
-# This script uses "sudo", so you may need to type in a password a couple times.
-
-MACPYTHON_URL=https://www.python.org/ftp/python
-MACPYTHON_PY_PREFIX=/Library/Frameworks/Python.framework/Versions
 DOWNLOAD_DIR=python_downloads
 
-PY_VERSIONS=("2.7.13"
-             "3.5.3"
-             "3.6.1"
-             "3.7.0")
-PY_INSTS=("python-2.7.13-macosx10.6.pkg"
-          "python-3.5.3-macosx10.6.pkg"
-          "python-3.6.1-macosx10.6.pkg"
-          "python-3.7.0-macosx10.6.pkg")
-PY_MMS=("2.7"
-        "3.5"
-        "3.6"
-        "3.7")
+NODE_VERSION="14"
 
-# The minimum supported numpy version is 1.14, see
-# https://issues.apache.org/jira/browse/ARROW-3141
-NUMPY_VERSIONS=("1.14.5"
-                "1.14.5"
-                "1.14.5"
-                "1.14.5")
+PY_MMS=("3.11" "3.12" "3.13" "3.14")
 
-./ci/travis/install-bazel.sh
+if [[ -n "${SKIP_DEP_RES}" ]]; then
+  ./ci/env/install-bazel.sh
 
-mkdir -p $DOWNLOAD_DIR
-mkdir -p .whl
+  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
 
-# Use the latest version of Node.js in order to build the dashboard.
-source $HOME/.nvm/nvm.sh
-nvm use node
+  if [ "$(uname -m)" = "arm64" ]; then
+    curl -o- https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-arm64.sh | bash
+  else
+    curl -sSL -o- https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-x86_64.sh | bash
+  fi
+
+  conda init bash
+  source ~/.bash_profile
+
+  # Use the latest version of Node.js in order to build the dashboard.
+  source "$HOME"/.nvm/nvm.sh
+  nvm install $NODE_VERSION
+  nvm use $NODE_VERSION
+fi
 
 # Build the dashboard so its static assets can be included in the wheel.
 pushd python/ray/dashboard/client
+  source "$HOME"/.nvm/nvm.sh
   npm ci
   npm run build
 popd
 
-for ((i=0; i<${#PY_VERSIONS[@]}; ++i)); do
-  PY_VERSION=${PY_VERSIONS[i]}
-  PY_INST=${PY_INSTS[i]}
+mkdir -p .whl
+
+for ((i=0; i<${#PY_MMS[@]}; ++i)); do
   PY_MM=${PY_MMS[i]}
-  NUMPY_VERSION=${NUMPY_VERSIONS[i]}
+  CONDA_ENV_NAME="p$PY_MM"
 
   # The -f flag is passed twice to also run git clean in the arrow subdirectory.
   # The -d flag removes directories. The -x flag ignores the .gitignore file,
   # and the -e flag ensures that we don't remove the .whl directory.
-  git clean -f -f -x -d -e .whl -e $DOWNLOAD_DIR -e python/ray/dashboard/client
+  git clean -f -f -x -d -e .whl -e $DOWNLOAD_DIR -e python/ray/dashboard/client -e dashboard/client
 
-  # Install Python.
-  INST_PATH=python_downloads/$PY_INST
-  curl $MACPYTHON_URL/$PY_VERSION/$PY_INST > $INST_PATH
-  sudo installer -pkg $INST_PATH -target /
+  # Install python using conda. This should be easier to produce consistent results in buildkite and locally.
+  [ ! -f "$HOME/.bash_profile" ] && conda init bash
+  source ~/.bash_profile
+  conda create -y -n "$CONDA_ENV_NAME"
+  conda activate "$CONDA_ENV_NAME"
+  conda remove -y python || true
+  # pip 26.2.2 is the eMudhra CA fix.
+  conda install -y python="$PY_MM" pip=26.2.2
 
-  PYTHON_EXE=$MACPYTHON_PY_PREFIX/$PY_MM/bin/python$PY_MM
-  PIP_CMD="$(dirname $PYTHON_EXE)/pip$PY_MM"
+  # NOTE: We expect conda to set the PATH properly.
+  PIP_CMD=pip
 
-  pushd /tmp
-    # Install latest version of pip to avoid brownouts.
-    curl https://bootstrap.pypa.io/get-pip.py | $PYTHON_EXE
-  popd
+  if [ -z "${TRAVIS_COMMIT}" ]; then
+    TRAVIS_COMMIT=${BUILDKITE_COMMIT}
+  fi
 
   pushd python
-    # Setuptools on CentOS is too old to install arrow 0.9.0, therefore we upgrade.
-    $PIP_CMD install --upgrade setuptools
-    # Install setuptools_scm because otherwise when building the wheel for
-    # Python 3.6, we see an error.
-    $PIP_CMD install -q setuptools_scm==3.1.0
-    # Fix the numpy version because this will be the oldest numpy version we can
-    # support.
-    $PIP_CMD install -q numpy==$NUMPY_VERSION cython==0.29.0
-    # Install wheel to avoid the error "invalid command 'bdist_wheel'".
-    $PIP_CMD install -q wheel
+    $PIP_CMD install -q setuptools==80.9.0 cython==3.0.12 wheel
+    # Set the commit SHA in _version.py.
+    if [ -n "$TRAVIS_COMMIT" ]; then
+      echo "TRAVIS_COMMIT variable detected. ray.__commit__ will be set to $TRAVIS_COMMIT"
+    else
+      echo "TRAVIS_COMMIT variable is not set, getting the current commit from git."
+      TRAVIS_COMMIT=$(git rev-parse HEAD)
+    fi
+
+    sed -i .bak "s/{{RAY_COMMIT_SHA}}/$TRAVIS_COMMIT/g" ray/_version.py && rm ray/_version.py.bak
+
     # Add the correct Python to the path and build the wheel. This is only
     # needed so that the installation finds the cython executable.
-    PATH=$MACPYTHON_PY_PREFIX/$PY_MM/bin:$PATH $PYTHON_EXE setup.py bdist_wheel
+    # build ray wheel
+    $PIP_CMD wheel -v -w dist . --no-deps
+    # build ray-cpp wheel
+    RAY_INSTALL_CPP=1 $PIP_CMD wheel -q -w dist . --no-deps
     mv dist/*.whl ../.whl/
   popd
+
+  # cleanup
+  conda deactivate
+  conda env remove -y -n "$CONDA_ENV_NAME"
 done

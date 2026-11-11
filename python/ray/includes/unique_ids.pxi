@@ -4,34 +4,42 @@ We define different types for different IDs for type safety.
 See https://github.com/ray-project/ray/issues/3721.
 """
 
-# WARNING: Any additional ID types defined in this file must be added to the
-# _ID_TYPES list at the bottom of this file.
+import logging
 import os
 
 from ray.includes.unique_ids cimport (
-    CActorCheckpointID,
     CActorClassID,
     CActorID,
-    CClientID,
+    CNodeID,
     CConfigID,
     CJobID,
     CFunctionID,
     CObjectID,
     CTaskID,
     CUniqueID,
-    CWorkerID
+    CWorkerID,
+    CPlacementGroupID,
+    CClusterID,
 )
 
+
 import ray
-from ray.utils import decode
+from ray._common.utils import decode
+
+logger = logging.getLogger(__name__)
 
 
 def check_id(b, size=kUniqueIDSize):
     if not isinstance(b, bytes):
-        raise TypeError("Unsupported type: " + str(type(b)))
+        raise TypeError(f"Unsupported type: {type(b)}, expected bytes")
     if len(b) != size:
         raise ValueError("ID string needs to have length " +
-                         str(size))
+                         str(size) + ", got " + str(len(b)))
+
+
+def check_nil(id_obj):
+    if id_obj.is_nil():
+        raise ValueError(f"{id_obj.__class__.__name__} is nil")
 
 
 cdef extern from "ray/common/constants.h" nogil:
@@ -40,20 +48,29 @@ cdef extern from "ray/common/constants.h" nogil:
 
 cdef class BaseID:
 
+    @classmethod
+    def from_binary(cls, id_bytes):
+        return cls(id_bytes)
+
+    @classmethod
+    def from_hex(cls, hex_id):
+        raise NotImplementedError
+
     cdef size_t hash(self):
-        pass
+        raise NotImplementedError
 
     def binary(self):
-        pass
+        raise NotImplementedError
 
-    def size(self):
-        pass
+    @classmethod
+    def size(cls):
+        raise NotImplementedError
 
     def hex(self):
-        pass
+        raise NotImplementedError
 
     def is_nil(self):
-        pass
+        raise NotImplementedError
 
     def __hash__(self):
         return self.hash()
@@ -62,7 +79,7 @@ cdef class BaseID:
         return type(self) == type(other) and self.binary() == other.binary()
 
     def __ne__(self, other):
-        return self.binary() != other.binary()
+        return type(self) != type(other) or self.binary() != other.binary()
 
     def __bytes__(self):
         return self.binary()
@@ -97,12 +114,6 @@ cdef class UniqueID(BaseID):
         self.data = CUniqueID.FromBinary(id)
 
     @classmethod
-    def from_binary(cls, id_bytes):
-        if not isinstance(id_bytes, bytes):
-            raise TypeError("Expect bytes, got " + str(type(id_bytes)))
-        return cls(id_bytes)
-
-    @classmethod
     def nil(cls):
         return cls(CUniqueID.Nil().Binary())
 
@@ -110,7 +121,8 @@ cdef class UniqueID(BaseID):
     def from_random(cls):
         return cls(CUniqueID.FromRandom().Binary())
 
-    def size(self):
+    @classmethod
+    def size(cls):
         return CUniqueID.Size()
 
     def binary(self):
@@ -126,77 +138,6 @@ cdef class UniqueID(BaseID):
         return self.data.Hash()
 
 
-cdef class ObjectID(BaseID):
-
-    def __init__(self, id):
-        check_id(id)
-        self.data = CObjectID.FromBinary(<c_string>id)
-        self.in_core_worker = False
-
-        worker = ray.worker.global_worker
-        # TODO(edoakes): there are dummy object IDs being created in
-        # includes/task.pxi before the core worker is initialized.
-        if hasattr(worker, "core_worker"):
-            worker.core_worker.add_object_id_reference(self)
-            self.in_core_worker = True
-
-    def __dealloc__(self):
-        if self.in_core_worker:
-            try:
-                worker = ray.worker.global_worker
-                worker.core_worker.remove_object_id_reference(self)
-            except Exception as e:
-                # There is a strange error in rllib that causes the above to
-                # fail. Somehow the global 'ray' variable corresponding to the
-                # imported package is None when this gets called. Unfortunately
-                # this is hard to debug because __dealloc__ is called during
-                # garbage collection so we can't get a good stack trace. In any
-                # case, there's not much we can do besides ignore it
-                # (re-importing ray won't help).
-                pass
-
-    cdef CObjectID native(self):
-        return <CObjectID>self.data
-
-    def size(self):
-        return CObjectID.Size()
-
-    def binary(self):
-        return self.data.Binary()
-
-    def hex(self):
-        return decode(self.data.Hex())
-
-    def is_direct_call_type(self):
-        return self.data.IsDirectCallType()
-
-    def with_plasma_transport_type(self):
-        return ObjectID(self.data.WithPlasmaTransportType().Binary())
-
-    def is_nil(self):
-        return self.data.IsNil()
-
-    def task_id(self):
-        return TaskID(self.data.TaskId().Binary())
-
-    def set_buffer_ref(self, ref):
-        self.buffer_ref = ref
-
-    def get_buffer_ref(self):
-        return self.buffer_ref
-
-    cdef size_t hash(self):
-        return self.data.Hash()
-
-    @classmethod
-    def nil(cls):
-        return cls(CObjectID.Nil().Binary())
-
-    @classmethod
-    def from_random(cls):
-        return cls(CObjectID.FromRandom().Binary())
-
-
 cdef class TaskID(BaseID):
     cdef CTaskID data
 
@@ -204,10 +145,16 @@ cdef class TaskID(BaseID):
         check_id(id, CTaskID.Size())
         self.data = CTaskID.FromBinary(<c_string>id)
 
+    @classmethod
+    def from_hex(cls, hex_id):
+        binary_id = CTaskID.FromHex(<c_string>hex_id).Binary()
+        return cls(binary_id)
+
     cdef CTaskID native(self):
         return <CTaskID>self.data
 
-    def size(self):
+    @classmethod
+    def size(cls):
         return CTaskID.Size()
 
     def binary(self):
@@ -218,6 +165,13 @@ cdef class TaskID(BaseID):
 
     def is_nil(self):
         return self.data.IsNil()
+
+    def actor_id(self):
+        return ActorID(self.data.ActorId().Binary())
+
+    def job_id(self):
+        check_nil(self)
+        return JobID(self.data.JobId().Binary())
 
     cdef size_t hash(self):
         return self.data.Hash()
@@ -227,12 +181,9 @@ cdef class TaskID(BaseID):
         return cls(CTaskID.Nil().Binary())
 
     @classmethod
-    def size(cls):
-        return CTaskID.Size()
-
-    @classmethod
-    def for_fake_task(cls):
-        return cls(CTaskID.ForFakeTask().Binary())
+    def for_fake_task(cls, job_id):
+        return cls(CTaskID.FromRandom(
+            CJobID.FromBinary(job_id.binary())).Binary())
 
     @classmethod
     def for_driver_task(cls, job_id):
@@ -266,14 +217,19 @@ cdef class TaskID(BaseID):
             CTaskID.FromBinary(parent_task_id.binary()),
             parent_task_counter).Binary())
 
-cdef class ClientID(UniqueID):
+cdef class NodeID(UniqueID):
 
     def __init__(self, id):
         check_id(id)
-        self.data = CClientID.FromBinary(<c_string>id)
+        self.data = CUniqueID.FromBinary(<c_string>id)
 
-    cdef CClientID native(self):
-        return <CClientID>self.data
+    @classmethod
+    def from_hex(cls, hex_id):
+        binary_id = CNodeID.FromHex(<c_string>hex_id).Binary()
+        return cls(binary_id)
+
+    cdef CNodeID native(self):
+        return <CNodeID>self.data
 
 
 cdef class JobID(BaseID):
@@ -283,12 +239,17 @@ cdef class JobID(BaseID):
         check_id(id, CJobID.Size())
         self.data = CJobID.FromBinary(<c_string>id)
 
+    @classmethod
+    def from_hex(cls, hex_id):
+        binary_id = CJobID.FromHex(<c_string>hex_id).Binary()
+        return cls(binary_id)
+
     cdef CJobID native(self):
         return <CJobID>self.data
 
     @classmethod
     def from_int(cls, value):
-        assert value < 65536, "Maximum JobID integer is 65535."
+        assert value < 2**32, "Maximum JobID integer is 2**32 - 1."
         return cls(CJobID.FromInt(value).Binary())
 
     @classmethod
@@ -299,14 +260,14 @@ cdef class JobID(BaseID):
     def size(cls):
         return CJobID.Size()
 
+    def int(self):
+        return self.data.ToInt()
+
     def binary(self):
         return self.data.Binary()
 
     def hex(self):
         return decode(self.data.Hex())
-
-    def size(self):
-        return CJobID.Size()
 
     def is_nil(self):
         return self.data.IsNil()
@@ -318,18 +279,20 @@ cdef class WorkerID(UniqueID):
 
     def __init__(self, id):
         check_id(id)
-        self.data = CWorkerID.FromBinary(<c_string>id)
+        self.data = CUniqueID.FromBinary(<c_string>id)
+
+    @classmethod
+    def from_hex(cls, hex_id):
+        binary_id = CWorkerID.FromHex(<c_string>hex_id).Binary()
+        return cls(binary_id)
 
     cdef CWorkerID native(self):
         return <CWorkerID>self.data
 
 cdef class ActorID(BaseID):
-    def __init__(self, id):
-        check_id(id, CActorID.Size())
-        self.data = CActorID.FromBinary(<c_string>id)
 
-    cdef CActorID native(self):
-        return <CActorID>self.data
+    def __init__(self, id):
+        self._set_id(id)
 
     @classmethod
     def of(cls, job_id, parent_task_id, parent_task_counter):
@@ -338,6 +301,11 @@ cdef class ActorID(BaseID):
         return cls(CActorID.Of(CJobID.FromBinary(job_id.binary()),
                                CTaskID.FromBinary(parent_task_id.binary()),
                                parent_task_counter).Binary())
+
+    @classmethod
+    def from_hex(cls, hex_id):
+        binary_id = CActorID.FromHex(<c_string>hex_id).Binary()
+        return cls(binary_id)
 
     @classmethod
     def nil(cls):
@@ -351,14 +319,20 @@ cdef class ActorID(BaseID):
     def size(cls):
         return CActorID.Size()
 
+    def _set_id(self, id):
+        check_id(id, CActorID.Size())
+        self.data = CActorID.FromBinary(<c_string>id)
+
+    @property
+    def job_id(self):
+        check_nil(self)
+        return JobID(self.data.JobId().Binary())
+
     def binary(self):
         return self.data.Binary()
 
     def hex(self):
         return decode(self.data.Hex())
-
-    def size(self):
-        return CActorID.Size()
 
     def is_nil(self):
         return self.data.IsNil()
@@ -366,22 +340,20 @@ cdef class ActorID(BaseID):
     cdef size_t hash(self):
         return self.data.Hash()
 
-
-cdef class ActorCheckpointID(UniqueID):
-
-    def __init__(self, id):
-        check_id(id)
-        self.data = CActorCheckpointID.FromBinary(<c_string>id)
-
-    cdef CActorCheckpointID native(self):
-        return <CActorCheckpointID>self.data
+    cdef CActorID native(self):
+        return <CActorID>self.data
 
 
 cdef class FunctionID(UniqueID):
 
     def __init__(self, id):
         check_id(id)
-        self.data = CFunctionID.FromBinary(<c_string>id)
+        self.data = CUniqueID.FromBinary(<c_string>id)
+
+    @classmethod
+    def from_hex(cls, hex_id):
+        binary_id = CFunctionID.FromHex(<c_string>hex_id).Binary()
+        return cls(binary_id)
 
     cdef CFunctionID native(self):
         return <CFunctionID>self.data
@@ -391,20 +363,74 @@ cdef class ActorClassID(UniqueID):
 
     def __init__(self, id):
         check_id(id)
-        self.data = CActorClassID.FromBinary(<c_string>id)
+        self.data = CUniqueID.FromBinary(<c_string>id)
+
+    @classmethod
+    def from_hex(cls, hex_id):
+        binary_id = CActorClassID.FromHex(<c_string>hex_id).Binary()
+        return cls(binary_id)
 
     cdef CActorClassID native(self):
         return <CActorClassID>self.data
 
-_ID_TYPES = [
-    ActorCheckpointID,
-    ActorClassID,
-    ActorID,
-    ClientID,
-    JobID,
-    WorkerID,
-    FunctionID,
-    ObjectID,
-    TaskID,
-    UniqueID,
-]
+cdef class ClusterID(UniqueID):
+
+    def __init__(self, id):
+        check_id(id)
+        self.data = CUniqueID.FromBinary(<c_string>id)
+
+    @classmethod
+    def from_hex(cls, hex_id):
+        binary_id = CClusterID.FromHex(<c_string>hex_id).Binary()
+        return cls(binary_id)
+
+    cdef CClusterID native(self):
+        return <CClusterID>self.data
+
+
+# This type alias is for backward compatibility.
+ObjectID = ObjectRef
+
+cdef class PlacementGroupID(BaseID):
+    cdef CPlacementGroupID data
+
+    def __init__(self, id):
+        check_id(id, CPlacementGroupID.Size())
+        self.data = CPlacementGroupID.FromBinary(<c_string>id)
+
+    cdef CPlacementGroupID native(self):
+        return <CPlacementGroupID>self.data
+
+    @classmethod
+    def from_hex(cls, hex_id):
+        binary_id = CPlacementGroupID.FromHex(<c_string>hex_id).Binary()
+        return cls(binary_id)
+
+    @classmethod
+    def from_random(cls):
+        return cls(os.urandom(CPlacementGroupID.Size()))
+
+    @classmethod
+    def of(cls, job_id):
+        assert isinstance(job_id, JobID)
+        return cls(CPlacementGroupID.Of(CJobID.FromBinary(job_id.binary())).Binary())
+
+    @classmethod
+    def nil(cls):
+        return cls(CPlacementGroupID.Nil().Binary())
+
+    @classmethod
+    def size(cls):
+        return CPlacementGroupID.Size()
+
+    def binary(self):
+        return self.data.Binary()
+
+    def hex(self):
+        return decode(self.data.Hex())
+
+    def is_nil(self):
+        return self.data.IsNil()
+
+    cdef size_t hash(self):
+        return self.data.Hash()
